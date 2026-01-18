@@ -7,3 +7,4 @@
 - 変更は小さな差分で進め、一定の部分まで開発したら `git commit` → `git push` を行う。
 - コミット/プッシュが終わったら、同時に `clasp push` も行う（必要なら `clasp deploy` でバージョン作成）。
 - `clasp push` 前に `clasp show-file-status` で反映対象を確認する（丸ごと置換事故の予防）。
+- `clasp run` を使ったテスト自動化（Workspace制限時の回避含む）は `docs/test_automation_vehicle_lease_renewal.md` を参照する。

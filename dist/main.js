@@ -149,10 +149,19 @@ function onOpen() {
         .addItem('テスト車両追加', 'seedTestVehicles')
         .addItem('ソースシート診断', 'diagnoseSourceSheets')
         .addItem('テスト一括実行(メール送信は設定次第)', 'runTestSuite')
+        .addItem('テストデータ掃除', 'cleanupTestData')
         .addItem('日次トリガー再作成', 'installDailyTriggers')
         .addSeparator()
         .addItem('日次一括実行', 'runDaily')
         .addToUi();
+}
+function uiAlertSafe(message) {
+    try {
+        SpreadsheetApp.getUi().alert(message);
+    }
+    catch (e) {
+        Logger.log(`UI alert skipped: ${message}`);
+    }
 }
 function syncSchema() {
     const lock = LockService.getDocumentLock();
@@ -204,8 +213,36 @@ function syncVehicles() {
     lock.waitLock(30000);
     try {
         const ss = getSpreadsheet();
-        ensureHeaders(ensureSheet(ss, SHEET_NAMES.VEHICLE_VIEW), 1, getSchemaHeaders(SHEET_NAMES.VEHICLE_VIEW));
+        const vehicleViewSheet = ensureSheet(ss, SHEET_NAMES.VEHICLE_VIEW);
+        ensureHeaders(vehicleViewSheet, 1, getSchemaHeaders(SHEET_NAMES.VEHICLE_VIEW));
         ensureHeaders(ensureSheet(ss, SHEET_NAMES.NEEDS_INPUT), 1, getSchemaHeaders(SHEET_NAMES.NEEDS_INPUT));
+        // 統合ビューは再生成するが、依頼/回答などの運用列は vehicleId キーで引き継ぐ
+        const existingByVehicleId = {};
+        const existingData = vehicleViewSheet.getDataRange().getValues();
+        if (existingData.length > 1) {
+            const existingHeader = getHeaderMap(existingData[0]);
+            const idxExisting = {
+                vehicleId: existingHeader['vehicleId'],
+                policy: existingHeader['更新方針'],
+                requestId: existingHeader['依頼ID'],
+                answeredAt: existingHeader['回答日'],
+                note: existingHeader['備考'],
+            };
+            if (idxExisting.vehicleId) {
+                for (let i = 1; i < existingData.length; i++) {
+                    const row = existingData[i];
+                    const vehicleId = getCellValue(row, idxExisting.vehicleId);
+                    if (!vehicleId)
+                        continue;
+                    existingByVehicleId[vehicleId] = {
+                        policy: getCellValue(row, idxExisting.policy),
+                        requestId: getCellValue(row, idxExisting.requestId),
+                        answeredAt: getCellRaw(row, idxExisting.answeredAt),
+                        note: getCellValue(row, idxExisting.note),
+                    };
+                }
+            }
+        }
         const deptMaster = loadDeptMaster();
         const rows = [];
         const needsInputRows = [];
@@ -231,17 +268,15 @@ function syncVehicles() {
                 const row = data[i];
                 if (row.every((cell) => cell === '' || cell === null))
                     continue;
-                const regArea = getCellValue(row, headerIndexes.regArea);
-                const regClass = getCellValue(row, headerIndexes.regClass);
-                const regKana = getCellValue(row, headerIndexes.regKana);
-                const regNumber = getCellValue(row, headerIndexes.regNumber);
-                const regCombined = buildRegistrationCombined(regArea, regClass, regKana, regNumber);
+                const regParts = getSourceRegistrationParts(row, headerIndexes);
+                const regCombined = getSourceRegistrationCombined(row, headerIndexes);
                 const vehicleType = getCellValue(row, headerIndexes.vehicleType);
                 const chassis = getCellValue(row, headerIndexes.chassis);
                 const contractStart = parseDateValue(getCellRaw(row, headerIndexes.contractStart));
                 const contractEnd = parseDateValue(getCellRaw(row, headerIndexes.contractEnd));
                 const dept = getCellValue(row, headerIndexes.dept);
                 const vehicleId = buildVehicleId(sheetName, regCombined, chassis, i + 1);
+                const existing = existingByVehicleId[vehicleId] || { policy: '', requestId: '', answeredAt: '', note: '' };
                 if (!contractEnd) {
                     needsInputRows.push([now, sheetName, vehicleId, dept, regCombined, vehicleType, '契約満了日なし']);
                 }
@@ -254,20 +289,20 @@ function syncVehicles() {
                 rows.push([
                     vehicleId,
                     sheetName,
-                    regArea,
-                    regClass,
-                    regKana,
-                    regNumber,
+                    regParts.area,
+                    regParts.cls,
+                    regParts.kana,
+                    regParts.num,
                     regCombined,
                     vehicleType,
                     chassis,
                     contractStart,
                     contractEnd,
                     dept,
-                    '',
-                    '',
-                    '',
-                    '',
+                    existing.policy,
+                    existing.requestId,
+                    existing.answeredAt,
+                    existing.note,
                 ]);
             }
         });
@@ -641,7 +676,7 @@ function applyAnswers() {
                 const row = data[i];
                 if (row.every((cell) => cell === '' || cell === null))
                     continue;
-                const regCombined = buildRegistrationCombined(getCellValue(row, headerIndexes.regArea), getCellValue(row, headerIndexes.regClass), getCellValue(row, headerIndexes.regKana), getCellValue(row, headerIndexes.regNumber));
+                const regCombined = getSourceRegistrationCombined(row, headerIndexes);
                 const chassis = getCellValue(row, headerIndexes.chassis);
                 const vehicleId = buildVehicleId(sheetName, regCombined, chassis, i + 1);
                 const answer = answerMap[vehicleId];
@@ -818,8 +853,12 @@ function seedTestVehicles() {
         const deptMaster = loadDeptMaster();
         const validDept = pickFirstActiveDept(deptMaster);
         if (!validDept) {
-            SpreadsheetApp.getUi().alert('部署マスタに有効な管理部門がありません。先に登録してください。');
-            return;
+            uiAlertSafe('部署マスタに有効な管理部門がありません。先に登録してください。');
+            return {
+                addedTotal: 0,
+                skippedSheets: SOURCE_SHEETS.slice(),
+                skippedReasons: { _global: '部署マスタに有効な管理部門がありません' },
+            };
         }
         const scenarios = [
             { code: 'IN', label: '期限内', contractEnd: inRangeDate, dept: validDept },
@@ -846,17 +885,13 @@ function seedTestVehicles() {
             }
             const headerMap = getHeaderMap(data[0]);
             const idx = resolveSourceHeaders(headerMap);
-            if (!idx.regArea || !idx.regClass || !idx.regKana || !idx.regNumber || !idx.dept || !idx.contractEnd) {
+            const hasSplitReg = !!(idx.regArea && idx.regClass && idx.regKana && idx.regNumber);
+            const hasAnyReg = hasSplitReg || !!idx.regAll;
+            if (!hasAnyReg || !idx.dept || !idx.contractEnd) {
                 skippedSheets.push(sheetName);
                 const missing = [];
-                if (!idx.regArea)
-                    missing.push('地名');
-                if (!idx.regClass)
-                    missing.push('分類番号');
-                if (!idx.regKana)
-                    missing.push('かな');
-                if (!idx.regNumber)
-                    missing.push('番号');
+                if (!hasAnyReg)
+                    missing.push('登録番号');
                 if (!idx.dept)
                     missing.push('管理部門');
                 if (!idx.contractEnd)
@@ -867,7 +902,7 @@ function seedTestVehicles() {
             const existingRegs = {};
             for (let i = 1; i < data.length; i++) {
                 const row = data[i];
-                const regCombined = buildRegistrationCombined(getCellValue(row, idx.regArea), getCellValue(row, idx.regClass), getCellValue(row, idx.regKana), getCellValue(row, idx.regNumber));
+                const regCombined = getSourceRegistrationCombined(row, idx);
                 if (regCombined)
                     existingRegs[regCombined] = true;
             }
@@ -882,10 +917,15 @@ function seedTestVehicles() {
                 if (existingRegs[regCombined])
                     return;
                 const row = new Array(data[0].length).fill('');
-                row[idx.regArea - 1] = regArea;
-                row[idx.regClass - 1] = regClass;
-                row[idx.regKana - 1] = regKana;
-                row[idx.regNumber - 1] = regNumber;
+                if (hasSplitReg) {
+                    row[idx.regArea - 1] = regArea;
+                    row[idx.regClass - 1] = regClass;
+                    row[idx.regKana - 1] = regKana;
+                    row[idx.regNumber - 1] = regNumber;
+                }
+                else if (idx.regAll) {
+                    row[idx.regAll - 1] = regCombined;
+                }
                 if (idx.vehicleType)
                     row[idx.vehicleType - 1] = `テスト_${scenario.label}`;
                 if (idx.chassis)
@@ -909,7 +949,8 @@ function seedTestVehicles() {
         const message = skippedSheets.length
             ? `テスト車両を追加しました（合計 ${addedTotal} 件）。\n未処理シート: ${skippedDetail}`
             : `テスト車両を追加しました（合計 ${addedTotal} 件）。`;
-        SpreadsheetApp.getUi().alert(message);
+        uiAlertSafe(message);
+        return { addedTotal, skippedSheets, skippedReasons };
     }
     finally {
         lock.releaseLock();
@@ -930,17 +971,14 @@ function diagnoseSourceSheets() {
             return;
         }
         const headers = data[0].map((h) => String(h || '').trim()).filter((h) => h);
+        const normalizedHeaders = headers.map((h) => normalizeHeaderKey(h)).filter((h) => h);
         const headerMap = getHeaderMap(data[0]);
         const idx = resolveSourceHeaders(headerMap);
         const missing = [];
-        if (!idx.regArea)
-            missing.push('地名');
-        if (!idx.regClass)
-            missing.push('分類番号');
-        if (!idx.regKana)
-            missing.push('かな');
-        if (!idx.regNumber)
-            missing.push('番号');
+        const hasSplitReg = !!(idx.regArea && idx.regClass && idx.regKana && idx.regNumber);
+        const hasAnyReg = hasSplitReg || !!idx.regAll;
+        if (!hasAnyReg)
+            missing.push('登録番号');
         if (!idx.dept)
             missing.push('管理部門');
         if (!idx.contractEnd)
@@ -949,13 +987,296 @@ function diagnoseSourceSheets() {
             sheetName,
             ok: missing.length === 0,
             missing,
+            registrationMode: hasSplitReg ? 'split' : idx.regAll ? 'combined' : 'missing',
             headers,
+            normalizedHeaders,
         });
     });
     Logger.log(JSON.stringify(results, null, 2));
     appendTestResult('ソースシート診断', results.every((r) => r.ok) ? 'OK' : 'NG', JSON.stringify(results));
-    SpreadsheetApp.getUi().alert('診断結果を Logger と テスト結果 シートに出力しました。');
+    uiAlertSafe('診断結果を Logger と テスト結果 シートに出力しました。');
     return results;
+}
+function exportTestResults(limit) {
+    const ss = getSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAMES.TEST_RESULTS);
+    if (!sheet)
+        return '[]';
+    const data = sheet.getDataRange().getValues();
+    if (data.length <= 1)
+        return '[]';
+    const max = typeof limit === 'number' && limit > 0 ? Math.floor(limit) : 200;
+    const rows = data.slice(1).slice(-max);
+    const toCellString = (value) => (value instanceof Date ? value.toISOString() : String(value || ''));
+    const result = rows.map((r) => ({
+        executedAt: toCellString(r[0]),
+        item: toCellString(r[1]),
+        result: toCellString(r[2]),
+        detail: toCellString(r[3]),
+    }));
+    return JSON.stringify(result);
+}
+function ping() {
+    return { ok: true, at: new Date().toISOString() };
+}
+function cleanupTestData() {
+    const lock = LockService.getDocumentLock();
+    lock.waitLock(30000);
+    try {
+        const ss = getSpreadsheet();
+        const testDept = 'テスト管理部門';
+        const removed = {
+            sourceSheets: {},
+            vehicleView: 0,
+            needsInput: 0,
+            requests: 0,
+            answers: 0,
+            summary: 0,
+            notifyLog: 0,
+            deptMaster: 0,
+            testRequestIds: 0,
+        };
+        const testVehicleIds = {};
+        const testRequestIds = {};
+        // 車両（統合ビュー）からテスト由来の vehicleId / requestId を収集しつつ削除
+        const vehicleViewSheet = ss.getSheetByName(SHEET_NAMES.VEHICLE_VIEW);
+        if (vehicleViewSheet) {
+            const data = vehicleViewSheet.getDataRange().getValues();
+            if (data.length > 1) {
+                const header = getHeaderMap(data[0]);
+                const idx = {
+                    vehicleId: header['vehicleId'],
+                    regCombined: header['登録番号_結合'],
+                    requestId: header['依頼ID'],
+                };
+                const rowsToDelete = [];
+                for (let i = 1; i < data.length; i++) {
+                    const row = data[i];
+                    const vehicleId = getCellValue(row, idx.vehicleId);
+                    const regCombined = getCellValue(row, idx.regCombined);
+                    const isTest = (regCombined && regCombined.startsWith('TEST')) || (vehicleId && vehicleId.indexOf('__TEST') >= 0);
+                    if (!isTest)
+                        continue;
+                    if (vehicleId)
+                        testVehicleIds[vehicleId] = true;
+                    const requestId = getCellValue(row, idx.requestId);
+                    if (requestId)
+                        testRequestIds[requestId] = true;
+                    rowsToDelete.push(i + 1);
+                }
+                for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+                    vehicleViewSheet.deleteRow(rowsToDelete[i]);
+                    removed.vehicleView += 1;
+                }
+            }
+        }
+        removed.testRequestIds = Object.keys(testRequestIds).length;
+        // 要入力（テスト車両由来のみ削除）
+        const needsInputSheet = ss.getSheetByName(SHEET_NAMES.NEEDS_INPUT);
+        if (needsInputSheet) {
+            const data = needsInputSheet.getDataRange().getValues();
+            if (data.length > 1) {
+                const header = getHeaderMap(data[0]);
+                const idx = {
+                    vehicleId: header['vehicleId'],
+                    regCombined: header['登録番号_結合'],
+                };
+                const rowsToDelete = [];
+                for (let i = 1; i < data.length; i++) {
+                    const row = data[i];
+                    const vehicleId = getCellValue(row, idx.vehicleId);
+                    const regCombined = getCellValue(row, idx.regCombined);
+                    const isTest = (vehicleId && testVehicleIds[vehicleId]) || (regCombined && regCombined.startsWith('TEST'));
+                    if (!isTest)
+                        continue;
+                    rowsToDelete.push(i + 1);
+                }
+                for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+                    needsInputSheet.deleteRow(rowsToDelete[i]);
+                    removed.needsInput += 1;
+                }
+            }
+        }
+        // 更新依頼（テスト管理部門 or テスト requestId のみ削除）
+        const requestSheet = ss.getSheetByName(SHEET_NAMES.REQUESTS);
+        if (requestSheet) {
+            const data = requestSheet.getDataRange().getValues();
+            if (data.length > 1) {
+                const header = getHeaderMap(data[0]);
+                const idx = {
+                    requestId: header['requestId'],
+                    dept: header['管理部門'],
+                };
+                const rowsToDelete = [];
+                for (let i = 1; i < data.length; i++) {
+                    const row = data[i];
+                    const requestId = getCellValue(row, idx.requestId);
+                    const dept = getCellValue(row, idx.dept);
+                    const isTest = (dept && dept === testDept) || (requestId && testRequestIds[requestId]);
+                    if (!isTest)
+                        continue;
+                    rowsToDelete.push(i + 1);
+                }
+                for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+                    requestSheet.deleteRow(rowsToDelete[i]);
+                    removed.requests += 1;
+                }
+            }
+        }
+        // 回答（テスト requestId / テスト vehicleId のみ削除）
+        const answerSheet = ss.getSheetByName(SHEET_NAMES.ANSWERS);
+        if (answerSheet) {
+            const data = answerSheet.getDataRange().getValues();
+            if (data.length > 1) {
+                const header = getHeaderMap(data[0]);
+                const idx = {
+                    requestId: header['requestId'],
+                    vehicleId: header['vehicleId'],
+                };
+                const rowsToDelete = [];
+                for (let i = 1; i < data.length; i++) {
+                    const row = data[i];
+                    const requestId = getCellValue(row, idx.requestId);
+                    const vehicleId = getCellValue(row, idx.vehicleId);
+                    const isTest = (requestId && testRequestIds[requestId]) || (vehicleId && testVehicleIds[vehicleId]);
+                    if (!isTest)
+                        continue;
+                    rowsToDelete.push(i + 1);
+                }
+                for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+                    answerSheet.deleteRow(rowsToDelete[i]);
+                    removed.answers += 1;
+                }
+            }
+        }
+        // 回答集計（テスト管理部門 or テスト requestId のみ削除）
+        const summarySheet = ss.getSheetByName(SHEET_NAMES.SUMMARY);
+        if (summarySheet) {
+            const data = summarySheet.getDataRange().getValues();
+            if (data.length > 1) {
+                const header = getHeaderMap(data[0]);
+                const idx = {
+                    requestId: header['requestId'],
+                    dept: header['管理部門'],
+                };
+                const rowsToDelete = [];
+                for (let i = 1; i < data.length; i++) {
+                    const row = data[i];
+                    const requestId = getCellValue(row, idx.requestId);
+                    const dept = getCellValue(row, idx.dept);
+                    const isTest = (dept && dept === testDept) || (requestId && testRequestIds[requestId]);
+                    if (!isTest)
+                        continue;
+                    rowsToDelete.push(i + 1);
+                }
+                for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+                    summarySheet.deleteRow(rowsToDelete[i]);
+                    removed.summary += 1;
+                }
+            }
+        }
+        // 通知ログ（テスト管理部門 or テスト requestId のみ削除）
+        const notifyLogSheet = ss.getSheetByName(SHEET_NAMES.NOTIFY_LOG);
+        if (notifyLogSheet) {
+            const data = notifyLogSheet.getDataRange().getValues();
+            if (data.length > 1) {
+                const header = getHeaderMap(data[0]);
+                const idx = {
+                    requestId: header['requestId'],
+                    dept: header['管理部門'],
+                };
+                const rowsToDelete = [];
+                for (let i = 1; i < data.length; i++) {
+                    const row = data[i];
+                    const requestId = getCellValue(row, idx.requestId);
+                    const dept = getCellValue(row, idx.dept);
+                    const isTest = (dept && dept === testDept) || (requestId && testRequestIds[requestId]);
+                    if (!isTest)
+                        continue;
+                    rowsToDelete.push(i + 1);
+                }
+                for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+                    notifyLogSheet.deleteRow(rowsToDelete[i]);
+                    removed.notifyLog += 1;
+                }
+            }
+        }
+        // 元台帳（3シート）からテスト車両行を削除
+        SOURCE_SHEETS.forEach((sheetName) => {
+            const sheet = ss.getSheetByName(sheetName);
+            if (!sheet)
+                return;
+            const data = sheet.getDataRange().getValues();
+            if (data.length <= 1)
+                return;
+            const headerMap = getHeaderMap(data[0]);
+            const idx = resolveSourceHeaders(headerMap);
+            const rowsToDelete = [];
+            for (let i = 1; i < data.length; i++) {
+                const row = data[i];
+                if (row.every((cell) => cell === '' || cell === null))
+                    continue;
+                const regCombined = getSourceRegistrationCombined(row, idx);
+                const chassis = getCellValue(row, idx.chassis);
+                const vehicleType = getCellValue(row, idx.vehicleType);
+                const isTest = (regCombined && String(regCombined).startsWith('TEST')) ||
+                    (chassis && String(chassis).startsWith('TEST-')) ||
+                    (vehicleType && String(vehicleType).startsWith('テスト_'));
+                if (!isTest)
+                    continue;
+                rowsToDelete.push(i + 1);
+            }
+            for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+                sheet.deleteRow(rowsToDelete[i]);
+            }
+            removed.sourceSheets[sheetName] = rowsToDelete.length;
+        });
+        // 部署マスタのテスト行は「テスト管理部門」を使っている車両が残っていない場合のみ削除
+        let testDeptInUse = false;
+        SOURCE_SHEETS.forEach((sheetName) => {
+            const sheet = ss.getSheetByName(sheetName);
+            if (!sheet)
+                return;
+            const data = sheet.getDataRange().getValues();
+            if (data.length <= 1)
+                return;
+            const headerMap = getHeaderMap(data[0]);
+            const idx = resolveSourceHeaders(headerMap);
+            if (!idx.dept)
+                return;
+            for (let i = 1; i < data.length; i++) {
+                const dept = getCellValue(data[i], idx.dept);
+                if (dept === testDept) {
+                    testDeptInUse = true;
+                    return;
+                }
+            }
+        });
+        const deptSheet = ss.getSheetByName(SHEET_NAMES.DEPT_MASTER);
+        if (deptSheet && !testDeptInUse) {
+            const data = deptSheet.getDataRange().getValues();
+            if (data.length > 1) {
+                const header = getHeaderMap(data[0]);
+                const idxDept = header['管理部門'];
+                const rowsToDelete = [];
+                for (let i = 1; i < data.length; i++) {
+                    const dept = getCellValue(data[i], idxDept);
+                    if (dept === testDept)
+                        rowsToDelete.push(i + 1);
+                }
+                for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+                    deptSheet.deleteRow(rowsToDelete[i]);
+                    removed.deptMaster += 1;
+                }
+            }
+        }
+        appendTestResult('cleanupTestData', 'OK', JSON.stringify(removed));
+        uiAlertSafe(`テストデータを掃除しました。\n${JSON.stringify(removed)}`);
+        return removed;
+    }
+    finally {
+        lock.releaseLock();
+    }
 }
 function runTestSuite() {
     const lock = LockService.getDocumentLock();
@@ -972,12 +1293,134 @@ function runTestSuite() {
             appendTestResult('中断', 'NG', 'ソースシートの必須ヘッダが不足しています');
             return;
         }
-        seedTestVehicles();
-        appendTestResult('seedTestVehicles', 'OK', '');
+        const seed = seedTestVehicles();
+        if (seed && seed.skippedSheets && seed.skippedSheets.length > 0) {
+            appendTestResult('seedTestVehicles', 'NG', JSON.stringify(seed));
+            appendTestResult('中断', 'NG', 'テスト車両を投入できないシートがあります');
+            return;
+        }
+        appendTestResult('seedTestVehicles', 'OK', seed ? JSON.stringify(seed) : '');
         syncVehicles();
         appendTestResult('syncVehicles', 'OK', '');
+        // 期待値チェック（再実行でもOKな形）
+        const ss = getSpreadsheet();
+        const tz = ss.getSpreadsheetTimeZone();
+        const settings = loadSettings();
+        const deptMaster = loadDeptMaster();
+        const validDept = pickFirstActiveDept(deptMaster);
+        const vehicleSheet = ss.getSheetByName(SHEET_NAMES.VEHICLE_VIEW);
+        if (vehicleSheet) {
+            const data = vehicleSheet.getDataRange().getValues();
+            const header = data.length > 0 ? getHeaderMap(data[0]) : {};
+            const idx = {
+                regCombined: header['登録番号_結合'],
+                dept: header['管理部門'],
+                contractEnd: header['契約満了日'],
+                requestId: header['依頼ID'],
+            };
+            const startDate = toDateOnly(new Date(), tz);
+            const endDate = addMonthsClamped(startDate, settings.expiryMonths);
+            let testTotal = 0;
+            let testInRange = 0;
+            let testInRangeWithRequestId = 0;
+            for (let i = 1; i < data.length; i++) {
+                const row = data[i];
+                const reg = getCellValue(row, idx.regCombined);
+                if (!reg || !reg.startsWith('TEST'))
+                    continue;
+                testTotal += 1;
+                const dept = getCellValue(row, idx.dept);
+                const contractEnd = parseDateValue(getCellRaw(row, idx.contractEnd));
+                const contractDate = contractEnd ? toDateOnly(contractEnd, tz) : null;
+                if (dept === validDept && contractDate && isWithinRange(contractDate, startDate, endDate)) {
+                    testInRange += 1;
+                    if (getCellValue(row, idx.requestId))
+                        testInRangeWithRequestId += 1;
+                }
+            }
+            appendTestResult('期待値:統合ビュー_テスト車両件数', testTotal >= 3 ? 'OK' : 'NG', String(testTotal));
+            appendTestResult('期待値:統合ビュー_期限内車両件数', testInRange >= SOURCE_SHEETS.length ? 'OK' : 'NG', `dept=${validDept || '(empty)'} count=${testInRange}`);
+            // createRequests 前なので依頼IDは「付いていても付いていなくても」OK（再実行想定）
+            appendTestResult('期待値:統合ビュー_期限内_依頼ID付与済(参考)', testInRangeWithRequestId <= testInRange ? 'OK' : 'NG', `${testInRangeWithRequestId}/${testInRange}台`);
+        }
+        const needsInputSheet = ss.getSheetByName(SHEET_NAMES.NEEDS_INPUT);
+        if (needsInputSheet) {
+            const data = needsInputSheet.getDataRange().getValues();
+            const header = data.length > 0 ? getHeaderMap(data[0]) : {};
+            const idx = { reason: header['不備内容'], reg: header['登録番号_結合'] };
+            const counts = {
+                契約満了日なし: 0,
+                管理部門なし: 0,
+                部署マスタ未登録: 0,
+            };
+            for (let i = 1; i < data.length; i++) {
+                const row = data[i];
+                const reg = getCellValue(row, idx.reg);
+                // テスト車両は登録番号_結合が "TEST..." になる
+                if (reg && !reg.startsWith('TEST'))
+                    continue;
+                const reason = getCellValue(row, idx.reason);
+                if (counts[reason] !== undefined)
+                    counts[reason] += 1;
+            }
+            Object.keys(counts).forEach((key) => {
+                appendTestResult(`期待値:要入力_${key}`, counts[key] >= 1 ? 'OK' : 'NG', String(counts[key]));
+            });
+        }
+        const requestSheet = ss.getSheetByName(SHEET_NAMES.REQUESTS);
+        const beforeRequestLastRow = requestSheet ? requestSheet.getLastRow() : 0;
         createRequests();
-        appendTestResult('createRequests', 'OK', '');
+        const afterRequestLastRow = requestSheet ? requestSheet.getLastRow() : 0;
+        appendTestResult('createRequests', 'OK', `newRows=${Math.max(0, afterRequestLastRow - beforeRequestLastRow)}`);
+        // 期待値: createRequests は同じ入力に対して増え続けない（重複防止）
+        const beforeSecondLastRow = requestSheet ? requestSheet.getLastRow() : 0;
+        createRequests();
+        const afterSecondLastRow = requestSheet ? requestSheet.getLastRow() : 0;
+        appendTestResult('期待値:createRequests_重複防止', afterSecondLastRow === beforeSecondLastRow ? 'OK' : 'NG', `newRows=${Math.max(0, afterSecondLastRow - beforeSecondLastRow)}`);
+        // 期待値: 期限内テスト車両へ依頼IDが付与され、依頼シートに管理部門行が存在する
+        if (vehicleSheet) {
+            const data = vehicleSheet.getDataRange().getValues();
+            const header = data.length > 0 ? getHeaderMap(data[0]) : {};
+            const idx = {
+                regCombined: header['登録番号_結合'],
+                dept: header['管理部門'],
+                contractEnd: header['契約満了日'],
+                requestId: header['依頼ID'],
+            };
+            const startDate = toDateOnly(new Date(), tz);
+            const endDate = addMonthsClamped(startDate, settings.expiryMonths);
+            let testInRange = 0;
+            let testInRangeWithRequestId = 0;
+            for (let i = 1; i < data.length; i++) {
+                const row = data[i];
+                const reg = getCellValue(row, idx.regCombined);
+                if (!reg || !reg.startsWith('TEST'))
+                    continue;
+                const dept = getCellValue(row, idx.dept);
+                const contractEnd = parseDateValue(getCellRaw(row, idx.contractEnd));
+                const contractDate = contractEnd ? toDateOnly(contractEnd, tz) : null;
+                if (dept === validDept && contractDate && isWithinRange(contractDate, startDate, endDate)) {
+                    testInRange += 1;
+                    if (getCellValue(row, idx.requestId))
+                        testInRangeWithRequestId += 1;
+                }
+            }
+            appendTestResult('期待値:createRequests_期限内_依頼ID付与', testInRange > 0 && testInRangeWithRequestId === testInRange ? 'OK' : 'NG', `${testInRangeWithRequestId}/${testInRange}台`);
+        }
+        if (requestSheet) {
+            const data = requestSheet.getDataRange().getValues();
+            const header = data.length > 0 ? getHeaderMap(data[0]) : {};
+            const idx = { dept: header['管理部門'], requestId: header['requestId'] };
+            let count = 0;
+            for (let i = 1; i < data.length; i++) {
+                const row = data[i];
+                if (!getCellValue(row, idx.requestId))
+                    continue;
+                if (validDept && getCellValue(row, idx.dept) === validDept)
+                    count += 1;
+            }
+            appendTestResult('期待値:createRequests_依頼行(dept)', count >= 1 ? 'OK' : 'NG', `dept=${validDept} count=${count}`);
+        }
         buildSummarySheet();
         appendTestResult('buildSummarySheet', 'OK', '');
         appendTestResult('完了', 'OK', '');
@@ -1085,22 +1528,114 @@ function getHeaderMap(headers) {
     return map;
 }
 function resolveSourceHeaders(headerMap) {
+    const normalizedMap = buildNormalizedHeaderMap(headerMap);
     return {
-        regArea: findHeaderIndex(headerMap, ['地名', '登録番号_地名', '登録番号（地名）']),
-        regClass: findHeaderIndex(headerMap, ['分類番号', '分類番号(3桁)', '分類番号（3桁）', '登録番号_分類']),
-        regKana: findHeaderIndex(headerMap, ['かな', '登録番号_かな']),
-        regNumber: findHeaderIndex(headerMap, ['番号', '登録番号_番号']),
-        vehicleType: findHeaderIndex(headerMap, ['車種']),
-        chassis: findHeaderIndex(headerMap, ['車台番号']),
-        contractStart: findHeaderIndex(headerMap, ['契約開始日']),
-        contractEnd: findHeaderIndex(headerMap, ['契約満了日', '契約終了日']),
-        dept: findHeaderIndex(headerMap, ['管理部門', '管理部署']),
+        regArea: findHeaderIndex(headerMap, normalizedMap, [
+            '地名',
+            '登録番号_地名',
+            '登録番号（地名）',
+            '登録番号(地名)',
+            '登録番号【地名】',
+            '登録番号地名',
+        ]),
+        regClass: findHeaderIndex(headerMap, normalizedMap, [
+            '分類番号',
+            '分類',
+            '分類番号(3桁)',
+            '分類番号（3桁）',
+            '分類番号3桁',
+            '分類(3桁)',
+            '分類（3桁）',
+            '分類3桁',
+            '登録番号_分類',
+            '登録番号（分類）',
+            '登録番号(分類)',
+            '登録番号【分類】',
+            '登録番号分類',
+        ]),
+        regKana: findHeaderIndex(headerMap, normalizedMap, [
+            'かな',
+            'カナ',
+            '登録番号_かな',
+            '登録番号（かな）',
+            '登録番号(かな)',
+            '登録番号【かな】',
+            '登録番号かな',
+            '登録番号カナ',
+        ]),
+        regNumber: findHeaderIndex(headerMap, normalizedMap, [
+            '番号',
+            '番号(4桁)',
+            '番号（4桁）',
+            '番号4桁',
+            '登録番号_番号',
+            '登録番号（番号）',
+            '登録番号(番号)',
+            '登録番号【番号】',
+        ]),
+        // 台帳が「登録番号」1列で持っているケースがある（分割列が無い/使わない）
+        regAll: findHeaderIndex(headerMap, normalizedMap, ['登録番号', '車両番号', '車両登録番号', 'ナンバー', 'ﾅﾝﾊﾞｰ']),
+        vehicleType: findHeaderIndex(headerMap, normalizedMap, ['車種', '車名', '車種名']),
+        chassis: findHeaderIndex(headerMap, normalizedMap, ['車台番号', '車体番号', '車台No', '車台NO', '車台No.']),
+        contractStart: findHeaderIndex(headerMap, normalizedMap, ['契約開始日', '契約開始', '開始日', 'リース開始日']),
+        contractEnd: findHeaderIndex(headerMap, normalizedMap, [
+            '契約満了日',
+            '契約満了',
+            '満了日',
+            '満了日（予定）',
+            '契約満了日（予定）',
+            'リース満了日',
+            'リース契約満了日',
+            '契約終了日',
+            '終了日',
+        ]),
+        dept: findHeaderIndex(headerMap, normalizedMap, [
+            '管理部門',
+            '管理部署',
+            '部署',
+            '部門',
+            '管理課',
+            '所属部署',
+            '所属部門',
+        ]),
     };
 }
-function findHeaderIndex(headerMap, names) {
+function normalizeHeaderKey(value) {
+    if (value === null || value === undefined)
+        return '';
+    return String(value)
+        .normalize('NFKC')
+        .trim()
+        .replace(/[\s\u3000]+/g, '')
+        .replace(/[＿_]/g, '')
+        .replace(/[()（）［］[\]【】{}｛｝<>＜＞]/g, '')
+        .replace(/[・]/g, '')
+        .replace(/[‐‑‒–—−-]/g, '');
+}
+function buildNormalizedHeaderMap(headerMap) {
+    const normalizedMap = {};
+    Object.keys(headerMap).forEach((key) => {
+        const normalized = normalizeHeaderKey(key);
+        if (!normalized)
+            return;
+        if (!normalizedMap[normalized])
+            normalizedMap[normalized] = headerMap[key];
+    });
+    return normalizedMap;
+}
+function findHeaderIndex(headerMap, normalizedMap, names) {
     for (const name of names) {
         if (headerMap[name])
             return headerMap[name];
+        const normalized = normalizeHeaderKey(name);
+        if (normalized && normalizedMap[normalized])
+            return normalizedMap[normalized];
+        // 表記ゆれ対策: 末尾の補足（例: "(3ケタ)" など）が付く場合をユニーク一致の範囲で吸収する
+        if (normalized) {
+            const matchedKeys = Object.keys(normalizedMap).filter((k) => k.includes(normalized));
+            if (matchedKeys.length === 1)
+                return normalizedMap[matchedKeys[0]];
+        }
     }
     return 0;
 }
@@ -1114,6 +1649,21 @@ function getCellRaw(row, index) {
     if (!index)
         return null;
     return row[index - 1];
+}
+function getSourceRegistrationParts(row, idx) {
+    return {
+        area: getCellValue(row, idx.regArea),
+        cls: getCellValue(row, idx.regClass),
+        kana: getCellValue(row, idx.regKana),
+        num: getCellValue(row, idx.regNumber),
+    };
+}
+function getSourceRegistrationCombined(row, idx) {
+    const fromAll = getCellValue(row, idx.regAll);
+    if (fromAll)
+        return fromAll;
+    const parts = getSourceRegistrationParts(row, idx);
+    return buildRegistrationCombined(parts.area, parts.cls, parts.kana, parts.num);
 }
 function parseDateValue(value) {
     if (!value)

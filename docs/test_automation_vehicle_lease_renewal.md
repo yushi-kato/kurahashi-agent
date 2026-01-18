@@ -39,9 +39,24 @@ GAS の関数で以下を一括実行し、結果を `テスト結果` シート
 
 - `npm run build`
 - `clasp push -f`
-- （可能なら）`clasp run runTestSuite`
+- （可能なら）`clasp -u runscope run runTestSuite`
+- （結果回収）`clasp -u runscope run exportTestResults --params "[200]"`（JSON文字列が返る）
 
-※ `clasp run` は Apps Script API と権限の都合で使えない場合がある。使えない場合は「シートのメニューから `runTestSuite` 実行」を残す。
+※ `clasp run` は Apps Script API と OAuth/Workspace 制限の都合で使えない場合がある。使えない場合は「シートのメニューから `runTestSuite` 実行」を残す。
+
+#### 重要: `clasp run` が 403 / “このアプリはブロックされます” になる場合
+
+- まず `.clasp.json` に `projectId` が入っていること（GCP紐づけ）
+- GCP（対象プロジェクト）で `script.googleapis.com`（Google Apps Script API）を有効化
+- Google Workspace で “このアプリはブロックされます” になる場合は、**自前の OAuth クライアント**で `clasp login` する
+  - GCPで OAuth クライアントID（種類: **デスクトップアプリ**）を作成して JSON をDL（先頭が `"installed"` の形式）
+  - 例: `clasp login -u runscope --creds ./client_secret_xxx.json --use-project-scopes`
+  - 以降の実行は `clasp -u runscope run ...`
+- `clasp run runTestSuite` が `No response.` と出ることがあるが、`テスト結果` / `exportTestResults()` で結果確認できる
+
+#### 重要: `exportTestResults()` が “配列” を返さない理由
+
+Apps Script Execution API（`clasp run`）は返却値の型に制約があるため、`exportTestResults()` は **JSON文字列**を返す。
 
 ### レイヤーC: Playwright（任意）で Web回答まで E2E 自動化
 
@@ -59,6 +74,13 @@ GAS の関数で以下を一括実行し、結果を `テスト結果` シート
 2) GASへ反映: `clasp push -f`
 3) スプレッドシートでメニュー → **「テスト一括実行(メール送信は設定次第)」**
 4) `テスト結果` を確認（NGがあれば原因の項目へ）
+
+### 3.3 テストデータの掃除
+
+台帳/統合ビュー/要入力/更新依頼/集計などに残った `TEST...` 系のテストデータを削除する。
+
+- スプレッドシートでメニュー → **「テストデータ掃除」**
+- CLIなら `clasp -u runscope run cleanupTestData`
 
 ### 3.2 期待する成果物（確認箇所）
 
@@ -82,6 +104,7 @@ GAS の関数で以下を一括実行し、結果を `テスト結果` シート
 3) 足りないヘッダ名があれば、`resolveSourceHeaders()` の alias に追加する
 
 ※ インポート元Excel由来の表記ゆれが起きやすい（例: `分類番号（３桁）` 等）。
+※ 台帳が「登録番号」1列（分割列なし）の場合は `registrationMode: combined` になり、現実装ではそのまま処理できる。
 
 ---
 
@@ -113,4 +136,3 @@ GAS の関数で以下を一括実行し、結果を `テスト結果` シート
 - 本番シートでテストを回す場合、`設定.通知_メール送信` は必ず OFF にしてから実行する
 - `seedTestVehicles()` は台帳に行を追加するため、可能ならテスト用スプレッドシートで実施する
 - ドリフト（ヘッダ名変更）が起きたら、まず `diagnoseSourceSheets()` で現状把握してから修正する
-
