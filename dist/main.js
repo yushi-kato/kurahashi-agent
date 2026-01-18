@@ -137,6 +137,9 @@ function onOpen() {
         .addItem('回答集計更新', 'buildSummarySheet')
         .addItem('集計メール送信', 'sendSummaryEmail')
         .addSeparator()
+        .addItem('設定ひな形作成', 'seedSettings')
+        .addItem('日次トリガー再作成', 'installDailyTriggers')
+        .addSeparator()
         .addItem('日次一括実行', 'runDaily')
         .addToUi();
 }
@@ -149,6 +152,7 @@ function syncSchema() {
             const sheet = ensureSheet(ss, def.name);
             ensureHeaders(sheet, def.headerRow, def.headers);
         });
+        seedSettings();
         const props = PropertiesService.getDocumentProperties();
         props.setProperty(PROP_KEYS.SCHEMA_VERSION, SCHEMA_VERSION);
         props.setProperty(PROP_KEYS.LAST_SCHEMA_SYNC_AT, new Date().toISOString());
@@ -758,6 +762,59 @@ function runDaily() {
     buildSummarySheet();
     sendSummaryEmail();
 }
+function seedSettings() {
+    const ss = getSpreadsheet();
+    const sheet = ensureSheet(ss, SHEET_NAMES.SETTINGS);
+    ensureHeaders(sheet, 1, getSchemaHeaders(SHEET_NAMES.SETTINGS));
+    const data = sheet.getDataRange().getValues();
+    if (data.length === 0)
+        return;
+    const headerMap = getHeaderMap(data[0]);
+    const keyIndex = headerMap['設定項目'];
+    const valueIndex = headerMap['値'];
+    const descIndex = headerMap['説明'];
+    if (!keyIndex || !valueIndex)
+        return;
+    const existingKeys = {};
+    for (let i = 1; i < data.length; i++) {
+        const key = getCellValue(data[i], keyIndex);
+        if (key)
+            existingKeys[key] = true;
+    }
+    const rows = [];
+    Object.keys(SETTINGS_DEFAULTS).forEach((key) => {
+        if (!existingKeys[key]) {
+            rows.push([key, SETTINGS_DEFAULTS[key], '']);
+        }
+    });
+    if (rows.length > 0) {
+        sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, descIndex ? 3 : 2).setValues(rows);
+    }
+}
+function setWebAppUrl(url) {
+    if (!url)
+        throw new Error('Web回答URLが指定されていません');
+    setSettingValue('Web回答URL（デプロイURL）', url);
+}
+function installDailyTriggers() {
+    const triggers = ScriptApp.getProjectTriggers();
+    triggers.forEach((trigger) => {
+        if (trigger.getHandlerFunction() === 'runDaily') {
+            ScriptApp.deleteTrigger(trigger);
+        }
+    });
+    const hour = 8;
+    const weekdays = [
+        ScriptApp.WeekDay.MONDAY,
+        ScriptApp.WeekDay.TUESDAY,
+        ScriptApp.WeekDay.WEDNESDAY,
+        ScriptApp.WeekDay.THURSDAY,
+        ScriptApp.WeekDay.FRIDAY,
+    ];
+    weekdays.forEach((day) => {
+        ScriptApp.newTrigger('runDaily').timeBased().onWeekDay(day).atHour(hour).create();
+    });
+}
 function getSpreadsheet() {
     return SpreadsheetApp.getActiveSpreadsheet();
 }
@@ -944,6 +1001,31 @@ function toStringValue(value, fallback) {
     if (value === null || value === undefined || value === '')
         return fallback;
     return String(value);
+}
+function setSettingValue(key, value) {
+    const ss = getSpreadsheet();
+    const sheet = ensureSheet(ss, SHEET_NAMES.SETTINGS);
+    ensureHeaders(sheet, 1, getSchemaHeaders(SHEET_NAMES.SETTINGS));
+    const data = sheet.getDataRange().getValues();
+    if (data.length === 0)
+        return;
+    const headerMap = getHeaderMap(data[0]);
+    const keyIndex = headerMap['設定項目'];
+    const valueIndex = headerMap['値'];
+    if (!keyIndex || !valueIndex)
+        return;
+    let rowIndex = 0;
+    for (let i = 1; i < data.length; i++) {
+        if (getCellValue(data[i], keyIndex) === key) {
+            rowIndex = i + 1;
+            break;
+        }
+    }
+    if (rowIndex === 0) {
+        rowIndex = sheet.getLastRow() + 1;
+        sheet.getRange(rowIndex, keyIndex, 1, 1).setValue(key);
+    }
+    sheet.getRange(rowIndex, valueIndex, 1, 1).setValue(value);
 }
 function writeSheetData(sheetName, rows) {
     const ss = getSpreadsheet();
