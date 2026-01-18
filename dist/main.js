@@ -11,6 +11,7 @@ const SHEET_NAMES = {
     ANSWERS: '回答',
     NOTIFY_LOG: '通知ログ',
     SUMMARY: '回答集計',
+    TEST_RESULTS: 'テスト結果',
 };
 const SOURCE_SHEETS = ['車両一覧', '車両一覧【ｹﾝｽｲ】', '車両一覧【ﾈｸｽﾄ】'];
 const REQUEST_STATUS = {
@@ -101,6 +102,11 @@ const SCHEMA_DEFS = [
             '最終更新日時',
         ],
     },
+    {
+        name: SHEET_NAMES.TEST_RESULTS,
+        headerRow: 1,
+        headers: ['実行日時', '項目', '結果', '詳細'],
+    },
 ];
 const SETTINGS_DEFAULTS = {
     抽出_満了まで月数: 6,
@@ -114,6 +120,7 @@ const SETTINGS_DEFAULTS = {
     'Web回答URL（デプロイURL）': '',
     管理者_通知先To: '',
     管理者_通知先Cc: '',
+    通知_メール送信: true,
     集計_シート出力: true,
     集計_メール送信: true,
 };
@@ -139,6 +146,9 @@ function onOpen() {
         .addSeparator()
         .addItem('設定ひな形作成', 'seedSettings')
         .addItem('部署トークン生成(空欄のみ)', 'generateDeptTokens')
+        .addItem('テスト車両追加', 'seedTestVehicles')
+        .addItem('ソースシート診断', 'diagnoseSourceSheets')
+        .addItem('テスト一括実行(メール送信は設定次第)', 'runTestSuite')
         .addItem('日次トリガー再作成', 'installDailyTriggers')
         .addSeparator()
         .addItem('日次一括実行', 'runDaily')
@@ -360,6 +370,10 @@ function sendInitialEmails() {
     try {
         const ss = getSpreadsheet();
         const settings = loadSettings();
+        if (!settings.mailSendEnabled) {
+            appendNotificationLog('初回', '', '', '', '通知_メール送信=FALSE のため送信をスキップ');
+            return;
+        }
         const deptMaster = loadDeptMaster();
         const requestSheet = ss.getSheetByName(SHEET_NAMES.REQUESTS);
         const vehicleSheet = ss.getSheetByName(SHEET_NAMES.VEHICLE_VIEW);
@@ -792,6 +806,186 @@ function seedSettings() {
         sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, descIndex ? 3 : 2).setValues(rows);
     }
 }
+function seedTestVehicles() {
+    const lock = LockService.getDocumentLock();
+    lock.waitLock(30000);
+    try {
+        const ss = getSpreadsheet();
+        const tz = ss.getSpreadsheetTimeZone();
+        const baseDate = toDateOnly(new Date(), tz);
+        const inRangeDate = addDays(baseDate, 1);
+        const outRangeDate = addMonthsClamped(baseDate, 7);
+        const deptMaster = loadDeptMaster();
+        const validDept = pickFirstActiveDept(deptMaster);
+        if (!validDept) {
+            SpreadsheetApp.getUi().alert('部署マスタに有効な管理部門がありません。先に登録してください。');
+            return;
+        }
+        const scenarios = [
+            { code: 'IN', label: '期限内', contractEnd: inRangeDate, dept: validDept },
+            { code: 'OUT', label: '期限外', contractEnd: outRangeDate, dept: validDept },
+            { code: 'NOEND', label: '満了日なし', contractEnd: null, dept: validDept },
+            { code: 'NODEPT', label: '管理部門なし', contractEnd: inRangeDate, dept: '' },
+            { code: 'UNREG', label: '部署未登録', contractEnd: inRangeDate, dept: '未登録部署_TEST' },
+        ];
+        let addedTotal = 0;
+        let skippedSheets = [];
+        const skippedReasons = {};
+        SOURCE_SHEETS.forEach((sheetName, index) => {
+            const sheet = ss.getSheetByName(sheetName);
+            if (!sheet) {
+                skippedSheets.push(sheetName);
+                skippedReasons[sheetName] = 'シート未存在';
+                return;
+            }
+            const data = sheet.getDataRange().getValues();
+            if (data.length === 0) {
+                skippedSheets.push(sheetName);
+                skippedReasons[sheetName] = 'データが空';
+                return;
+            }
+            const headerMap = getHeaderMap(data[0]);
+            const idx = resolveSourceHeaders(headerMap);
+            if (!idx.regArea || !idx.regClass || !idx.regKana || !idx.regNumber || !idx.dept || !idx.contractEnd) {
+                skippedSheets.push(sheetName);
+                const missing = [];
+                if (!idx.regArea)
+                    missing.push('地名');
+                if (!idx.regClass)
+                    missing.push('分類番号');
+                if (!idx.regKana)
+                    missing.push('かな');
+                if (!idx.regNumber)
+                    missing.push('番号');
+                if (!idx.dept)
+                    missing.push('管理部門');
+                if (!idx.contractEnd)
+                    missing.push('契約満了日');
+                skippedReasons[sheetName] = `必須ヘッダ不足: ${missing.join(', ')}`;
+                return;
+            }
+            const existingRegs = {};
+            for (let i = 1; i < data.length; i++) {
+                const row = data[i];
+                const regCombined = buildRegistrationCombined(getCellValue(row, idx.regArea), getCellValue(row, idx.regClass), getCellValue(row, idx.regKana), getCellValue(row, idx.regNumber));
+                if (regCombined)
+                    existingRegs[regCombined] = true;
+            }
+            const rowsToAdd = [];
+            const sheetCode = String(index + 1).padStart(2, '0');
+            scenarios.forEach((scenario) => {
+                const regArea = 'TEST';
+                const regClass = sheetCode;
+                const regKana = 'テ';
+                const regNumber = `T${sheetCode}-${scenario.code}`;
+                const regCombined = buildRegistrationCombined(regArea, regClass, regKana, regNumber);
+                if (existingRegs[regCombined])
+                    return;
+                const row = new Array(data[0].length).fill('');
+                row[idx.regArea - 1] = regArea;
+                row[idx.regClass - 1] = regClass;
+                row[idx.regKana - 1] = regKana;
+                row[idx.regNumber - 1] = regNumber;
+                if (idx.vehicleType)
+                    row[idx.vehicleType - 1] = `テスト_${scenario.label}`;
+                if (idx.chassis)
+                    row[idx.chassis - 1] = `TEST-${sheetCode}-${scenario.code}`;
+                if (idx.contractStart)
+                    row[idx.contractStart - 1] = baseDate;
+                if (idx.contractEnd && scenario.contractEnd)
+                    row[idx.contractEnd - 1] = scenario.contractEnd;
+                row[idx.dept - 1] = scenario.dept;
+                rowsToAdd.push(row);
+                existingRegs[regCombined] = true;
+            });
+            if (rowsToAdd.length > 0) {
+                sheet.getRange(sheet.getLastRow() + 1, 1, rowsToAdd.length, data[0].length).setValues(rowsToAdd);
+                addedTotal += rowsToAdd.length;
+            }
+        });
+        const skippedDetail = skippedSheets
+            .map((name) => `${name}(${skippedReasons[name] || '不明'})`)
+            .join(', ');
+        const message = skippedSheets.length
+            ? `テスト車両を追加しました（合計 ${addedTotal} 件）。\n未処理シート: ${skippedDetail}`
+            : `テスト車両を追加しました（合計 ${addedTotal} 件）。`;
+        SpreadsheetApp.getUi().alert(message);
+    }
+    finally {
+        lock.releaseLock();
+    }
+}
+function diagnoseSourceSheets() {
+    const ss = getSpreadsheet();
+    const results = [];
+    SOURCE_SHEETS.forEach((sheetName) => {
+        const sheet = ss.getSheetByName(sheetName);
+        if (!sheet) {
+            results.push({ sheetName, ok: false, reason: 'シート未存在' });
+            return;
+        }
+        const data = sheet.getDataRange().getValues();
+        if (data.length === 0) {
+            results.push({ sheetName, ok: false, reason: 'データが空' });
+            return;
+        }
+        const headers = data[0].map((h) => String(h || '').trim()).filter((h) => h);
+        const headerMap = getHeaderMap(data[0]);
+        const idx = resolveSourceHeaders(headerMap);
+        const missing = [];
+        if (!idx.regArea)
+            missing.push('地名');
+        if (!idx.regClass)
+            missing.push('分類番号');
+        if (!idx.regKana)
+            missing.push('かな');
+        if (!idx.regNumber)
+            missing.push('番号');
+        if (!idx.dept)
+            missing.push('管理部門');
+        if (!idx.contractEnd)
+            missing.push('契約満了日');
+        results.push({
+            sheetName,
+            ok: missing.length === 0,
+            missing,
+            headers,
+        });
+    });
+    Logger.log(JSON.stringify(results, null, 2));
+    appendTestResult('ソースシート診断', results.every((r) => r.ok) ? 'OK' : 'NG', JSON.stringify(results));
+    SpreadsheetApp.getUi().alert('診断結果を Logger と テスト結果 シートに出力しました。');
+    return results;
+}
+function runTestSuite() {
+    const lock = LockService.getDocumentLock();
+    lock.waitLock(30000);
+    try {
+        clearTestResults();
+        appendTestResult('開始', 'OK', new Date().toISOString());
+        syncSchema();
+        appendTestResult('syncSchema', 'OK', '');
+        generateDeptTokens();
+        appendTestResult('generateDeptTokens', 'OK', '空欄のみ生成');
+        const diag = diagnoseSourceSheets();
+        if (!diag.every((r) => r.ok)) {
+            appendTestResult('中断', 'NG', 'ソースシートの必須ヘッダが不足しています');
+            return;
+        }
+        seedTestVehicles();
+        appendTestResult('seedTestVehicles', 'OK', '');
+        syncVehicles();
+        appendTestResult('syncVehicles', 'OK', '');
+        createRequests();
+        appendTestResult('createRequests', 'OK', '');
+        buildSummarySheet();
+        appendTestResult('buildSummarySheet', 'OK', '');
+        appendTestResult('完了', 'OK', '');
+    }
+    finally {
+        lock.releaseLock();
+    }
+}
 function generateDeptTokens() {
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
@@ -1011,6 +1205,7 @@ function loadSettings() {
         webAppUrl: toStringValue(values['Web回答URL（デプロイURL）'], String(SETTINGS_DEFAULTS['Web回答URL（デプロイURL）'])),
         adminTo: toStringValue(values['管理者_通知先To'], String(SETTINGS_DEFAULTS['管理者_通知先To'])),
         adminCc: toStringValue(values['管理者_通知先Cc'], String(SETTINGS_DEFAULTS['管理者_通知先Cc'])),
+        mailSendEnabled: toBoolean(values['通知_メール送信'], Boolean(SETTINGS_DEFAULTS['通知_メール送信'])),
         summarySheetEnabled: toBoolean(values['集計_シート出力'], Boolean(SETTINGS_DEFAULTS['集計_シート出力'])),
         summaryEmailEnabled: toBoolean(values['集計_メール送信'], Boolean(SETTINGS_DEFAULTS['集計_メール送信'])),
     };
@@ -1037,6 +1232,28 @@ function toStringValue(value, fallback) {
     if (value === null || value === undefined || value === '')
         return fallback;
     return String(value);
+}
+function pickFirstActiveDept(deptMaster) {
+    const keys = Object.keys(deptMaster);
+    for (const key of keys) {
+        if (deptMaster[key].active)
+            return key;
+    }
+    return '';
+}
+function clearTestResults() {
+    const ss = getSpreadsheet();
+    const sheet = ensureSheet(ss, SHEET_NAMES.TEST_RESULTS);
+    ensureHeaders(sheet, 1, getSchemaHeaders(SHEET_NAMES.TEST_RESULTS));
+    if (sheet.getLastRow() > 1) {
+        sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).clearContent();
+    }
+}
+function appendTestResult(item, result, detail) {
+    const ss = getSpreadsheet();
+    const sheet = ensureSheet(ss, SHEET_NAMES.TEST_RESULTS);
+    ensureHeaders(sheet, 1, getSchemaHeaders(SHEET_NAMES.TEST_RESULTS));
+    sheet.appendRow([new Date(), item, result, detail]);
 }
 function setSettingValue(key, value) {
     const ss = getSpreadsheet();
