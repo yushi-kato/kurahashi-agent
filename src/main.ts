@@ -147,6 +147,7 @@ function onOpen() {
     .addItem('集計メール送信', 'sendSummaryEmail')
     .addSeparator()
     .addItem('設定ひな形作成', 'seedSettings')
+    .addItem('部署トークン生成(空欄のみ)', 'generateDeptTokens')
     .addItem('日次トリガー再作成', 'installDailyTriggers')
     .addSeparator()
     .addItem('日次一括実行', 'runDaily')
@@ -828,6 +829,40 @@ function seedSettings() {
 
   if (rows.length > 0) {
     sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, descIndex ? 3 : 2).setValues(rows);
+  }
+}
+
+function generateDeptTokens() {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    const ss = getSpreadsheet();
+    const sheet = ensureSheet(ss, SHEET_NAMES.DEPT_MASTER);
+    ensureHeaders(sheet, 1, getSchemaHeaders(SHEET_NAMES.DEPT_MASTER));
+    const data = sheet.getDataRange().getValues();
+    if (data.length <= 1) return;
+    const headerMap = getHeaderMap(data[0]);
+    const deptIndex = headerMap['管理部門'];
+    const tokenIndex = headerMap['部門トークン'];
+    if (!deptIndex || !tokenIndex) return;
+
+    let changed = false;
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      const dept = getCellValue(row, deptIndex);
+      if (!dept) continue;
+      const token = getCellValue(row, tokenIndex);
+      if (!token) {
+        row[tokenIndex - 1] = generateToken();
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      sheet.getRange(1, 1, data.length, data[0].length).setValues(data);
+    }
+  } finally {
+    lock.releaseLock();
   }
 }
 
