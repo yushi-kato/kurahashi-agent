@@ -1,0 +1,11 @@
+{
+  "name": "kurahashi-gas",
+  "private": true,
+  "scripts": {
+    "build": "tsc && cp src/appsscript.json dist/appsscript.json"
+  },
+  "devDependencies": {
+    "@types/google-apps-script": "^1.0.83",
+    "typescript": "^5.3.3"
+  }
+}

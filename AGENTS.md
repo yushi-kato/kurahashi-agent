@@ -1,0 +1,9 @@
+- このリポジトリは Google Apps Script（GAS / V8）向けの開発を行う。
+- **実装はローカルで TypeScript で行い、GASへはビルド成果物（JavaScript/バンドル）を `clasp push` で反映する前提**で運用する（GAS上で直接編集しない）。
+- claspの挙動（TSトランスパイル等）に依存しないため、**必ず事前にビルドして `dist/` をpush対象に固定**する（`.clasp.json` の `rootDir` を `dist` にする想定）。
+- GAS特有の制約・落とし穴・安定開発フローは `development_tips_for_gas.md` を参照する。
+- スプレッドシートの「タブ/ヘッダ」スキーマをコードで管理するルールは `gas_for_lease_management/sheet_schema_management_rules.md` を参照する。
+- `clasp pull` は原則しない（やむを得ず使う場合は理由を明記し、差分を確認してから）。
+- 変更は小さな差分で進め、一定の部分まで開発したら `git commit` → `git push` を行う。
+- コミット/プッシュが終わったら、同時に `clasp push` も行う（必要なら `clasp deploy` でバージョン作成）。
+- `clasp push` 前に `clasp show-file-status` で反映対象を確認する（丸ごと置換事故の予防）。
