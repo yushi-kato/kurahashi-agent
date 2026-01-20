@@ -479,6 +479,20 @@ function sendInitialEmails() {
             const targetEnd = parseDateValue(getCellRaw(row, reqHeader['対象終了日']));
             const deadline = parseDateValue(getCellRaw(row, reqHeader['締切日']));
             let formUrls = extractFormUrlsFromRequestRow(row, reqHeader);
+            const formIds = extractFormIdsFromRequestRow(row, reqHeader);
+            if (formIds.length > 0) {
+                normalizeExistingFormsForRequest({
+                    formIds,
+                    vehicles,
+                    vehicleHeader,
+                    tz,
+                    targetStart,
+                    targetEnd,
+                    deadline,
+                    dept,
+                    requestId,
+                });
+            }
             if (formUrls.length === 0) {
                 const formResult = createRequestForms({
                     requestId,
@@ -2122,6 +2136,13 @@ function extractFormUrlsFromRequestRow(row, headerMap) {
     const url = getCellValue(row, headerMap['formUrl']);
     return url ? [String(url)] : [];
 }
+function extractFormIdsFromRequestRow(row, headerMap) {
+    const ids = parseJsonStringArray(getCellValue(row, headerMap['formIdsJson']));
+    if (ids.length > 0)
+        return ids;
+    const id = getCellValue(row, headerMap['formId']);
+    return id ? [String(id)] : [];
+}
 function applyFormResultToRequestRow(row, headerMap, result, createdAt) {
     const setCell = (headerName, value) => {
         const idx = headerMap[headerName];
@@ -2148,20 +2169,10 @@ function createRequestForms(params) {
         chunks.forEach((chunk, index) => {
             const title = buildFormTitle(params.dept, params.requestId, index, parts);
             const form = FormApp.create(title);
-            form.setRequireLogin(false);
-            form.setCollectEmail(false);
-            form.setLimitOneResponsePerUser(false);
-            form.setShowLinkToRespondAgain(false);
+            applyFormPublicSettings(form);
             form.setDescription(buildFormDescription(params, index, parts, params.tz));
             form.setConfirmationMessage('回答を受け付けました。ありがとうございました。');
-            const header = form.addSectionHeaderItem();
-            header.setTitle('ご回答方法');
-            header.setHelpText([
-                '1) 「更新方針（車両ごと）」は必須です（未定も選べます）。',
-                '2) 車両の並びは、通知メールの一覧と同じ順です。',
-                '3) 「コメント（任意）」は全体コメント、または「1: コメント」のように番号で車両別コメントも書けます。',
-                '※このフォームのURLは転送しないでください。',
-            ].join('\n'));
+            ensureFormExplanationHeader(form);
             const responderItem = form.addTextItem();
             responderItem.setTitle(FORM_ITEM_TITLES.RESPONDER);
             const gridItem = form.addGridItem();
@@ -2199,6 +2210,97 @@ function createRequestForms(params) {
             formTriggerIds: [],
         };
     }
+}
+function applyFormPublicSettings(form) {
+    form.setRequireLogin(false);
+    form.setCollectEmail(false);
+    form.setLimitOneResponsePerUser(false);
+    form.setShowLinkToRespondAgain(false);
+}
+function ensureFormExplanationHeader(form) {
+    const items = form.getItems(FormApp.ItemType.SECTION_HEADER);
+    const existing = items.find((item) => item.getTitle() === 'ご回答方法');
+    if (existing) {
+        moveItemToTopByTypeAndTitle(form, FormApp.ItemType.SECTION_HEADER, 'ご回答方法');
+        return;
+    }
+    const header = form.addSectionHeaderItem();
+    header.setTitle('ご回答方法');
+    header.setHelpText([
+        '1) 「更新方針（車両ごと）」は必須です（未定も選べます）。',
+        '2) 車両の並びは、通知メールの一覧と同じ順です。',
+        '3) 「コメント（任意）」は全体コメント、または「1: コメント」のように番号で車両別コメントも書けます。',
+        '※このフォームのURLは転送しないでください。',
+    ].join('\n'));
+    moveLastItemToTop(form);
+}
+function moveItemToTopByTypeAndTitle(form, itemType, title) {
+    try {
+        const all = form.getItems();
+        const idx = all.findIndex((item) => item.getType() === itemType && item.getTitle() === title);
+        if (idx > 0)
+            form.moveItem(idx, 0);
+    }
+    catch (err) {
+        // move に失敗しても致命ではない
+    }
+}
+function moveLastItemToTop(form) {
+    try {
+        const all = form.getItems();
+        if (all.length > 1) {
+            form.moveItem(all.length - 1, 0);
+        }
+    }
+    catch (err) {
+        // move に失敗しても致命ではない
+    }
+}
+function normalizeExistingFormsForRequest(params) {
+    if (!params.formIds || params.formIds.length === 0)
+        return;
+    const props = PropertiesService.getDocumentProperties();
+    let cursor = 0;
+    params.formIds.forEach((formId, formIndex) => {
+        try {
+            const form = FormApp.openById(formId);
+            applyFormPublicSettings(form);
+            ensureFormExplanationHeader(form);
+            form.setDescription(buildFormDescription(params, formIndex, params.formIds.length, params.tz));
+            const gridItem = findPolicyGridItem(form);
+            if (!gridItem)
+                return;
+            const rowCount = gridItem.getRows().length;
+            if (rowCount <= 0)
+                return;
+            const sliceVehicles = params.vehicles.slice(cursor, cursor + rowCount);
+            cursor += rowCount;
+            if (sliceVehicles.length > 0) {
+                gridItem.setRows(sliceVehicles.map((row, rowIndex) => buildFormVehicleRowLabel(row, params.vehicleHeader, params.tz, rowIndex)));
+                gridItem.setColumns(ANSWER_OPTIONS);
+                gridItem.setRequired(true);
+                const vehicleIds = sliceVehicles.map((row) => getCellValue(row, params.vehicleHeader['vehicleId']) || '');
+                props.setProperty(buildFormVehicleIdsPropKey(formId), JSON.stringify(vehicleIds));
+            }
+        }
+        catch (err) {
+            Logger.log(`normalizeExistingFormsForRequest: ${formId} ${err}`);
+        }
+    });
+}
+function findPolicyGridItem(form) {
+    const items = form.getItems(FormApp.ItemType.GRID);
+    for (const item of items) {
+        if (item.getTitle() === FORM_ITEM_TITLES.POLICY_GRID) {
+            try {
+                return item.asGridItem();
+            }
+            catch (err) {
+                return null;
+            }
+        }
+    }
+    return null;
 }
 function buildFormTitle(dept, requestId, index, total) {
     let title = `【車両更新方針】${dept} ${requestId}`;
