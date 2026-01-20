@@ -22,6 +22,12 @@ const REQUEST_STATUS = {
     EXPIRED: '締切',
 };
 const ANSWER_OPTIONS = ['再リース', '新車入替', '廃止', '未定'];
+const MAX_VEHICLES_PER_FORM = 50;
+const FORM_ITEM_TITLES = {
+    RESPONDER: '回答者（任意）',
+    POLICY_GRID: '更新方針（車両ごと）',
+    COMMENT: 'コメント（任意）',
+};
 const SCHEMA_DEFS = [
     {
         name: SHEET_NAMES.SETTINGS,
@@ -74,6 +80,13 @@ const SCHEMA_DEFS = [
             '最終リマインド日時',
             'リマインド回数',
             'requestToken',
+            'formId',
+            'formUrl',
+            'formIdsJson',
+            'formUrlsJson',
+            'formEditUrl',
+            'formTriggerId',
+            'フォーム作成日時',
         ],
     },
     {
@@ -378,18 +391,23 @@ function createRequests() {
         Object.keys(requestsByDept).forEach((dept) => {
             const requestId = generateRequestId(now);
             const requestToken = generateToken();
-            newRequestRows.push([
-                requestId,
-                dept,
-                startDate,
-                endDate,
-                deadline,
-                REQUEST_STATUS.CREATED,
-                '',
-                '',
-                0,
-                requestToken,
-            ]);
+            const row = new Array(requestSheet.getLastColumn()).fill('');
+            const setCell = (headerName, value) => {
+                const idx = requestHeader[headerName];
+                if (idx)
+                    row[idx - 1] = value;
+            };
+            setCell('requestId', requestId);
+            setCell('管理部門', dept);
+            setCell('対象開始日', startDate);
+            setCell('対象終了日', endDate);
+            setCell('締切日', deadline);
+            setCell('ステータス', REQUEST_STATUS.CREATED);
+            setCell('初回送信日時', '');
+            setCell('最終リマインド日時', '');
+            setCell('リマインド回数', 0);
+            setCell('requestToken', requestToken);
+            newRequestRows.push(row);
             // 車両統合ビューへ依頼IDを反映
             requestsByDept[dept].forEach((item) => {
                 const rowIndex = item.rowIndex;
@@ -437,22 +455,15 @@ function sendInitialEmails() {
                 continue;
             const requestId = getCellValue(row, reqHeader['requestId']);
             const dept = getCellValue(row, reqHeader['管理部門']);
-            const requestToken = getCellValue(row, reqHeader['requestToken']);
             const deptInfo = deptMaster[dept];
+            if (!requestId)
+                continue;
             if (!deptInfo || !deptInfo.active) {
                 appendNotificationLog('初回', dept, '', requestId, '部署マスタ未登録/無効');
                 continue;
             }
-            if (!requestToken || !deptInfo.token) {
-                appendNotificationLog('初回', dept, deptInfo.to, requestId, 'トークン不足');
-                continue;
-            }
             if (!deptInfo.to) {
                 appendNotificationLog('初回', dept, '', requestId, '通知先Toが未設定');
-                continue;
-            }
-            if (!settings.webAppUrl) {
-                appendNotificationLog('初回', dept, deptInfo.to, requestId, 'Web回答URLが未設定');
                 continue;
             }
             const vehicles = vehicleData
@@ -465,31 +476,50 @@ function sendInitialEmails() {
             const targetStart = parseDateValue(getCellRaw(row, reqHeader['対象開始日']));
             const targetEnd = parseDateValue(getCellRaw(row, reqHeader['対象終了日']));
             const deadline = parseDateValue(getCellRaw(row, reqHeader['締切日']));
-            const url = buildWebAppUrl(settings.webAppUrl, {
-                requestId,
-                token: requestToken,
-                dept,
-                deptToken: deptInfo.token,
-            });
+            let formUrls = extractFormUrlsFromRequestRow(row, reqHeader);
+            if (formUrls.length === 0) {
+                const formResult = createRequestForms({
+                    requestId,
+                    dept,
+                    vehicles,
+                    vehicleHeader,
+                    tz,
+                    targetStart,
+                    targetEnd,
+                    deadline,
+                });
+                if (!formResult.ok) {
+                    appendNotificationLog('初回', dept, deptInfo.to, requestId, `フォーム作成失敗: ${formResult.message}`);
+                    continue;
+                }
+                applyFormResultToRequestRow(row, reqHeader, formResult, now);
+                formUrls = formResult.formUrls;
+            }
+            if (formUrls.length === 0) {
+                appendNotificationLog('初回', dept, deptInfo.to, requestId, 'フォームURLが未設定');
+                continue;
+            }
             const listText = vehicles
                 .map((v) => formatVehicleLine(v, vehicleHeader, tz))
                 .join('\n');
             const listHtml = vehicles
                 .map((v) => `<li>${escapeHtml(formatVehicleLine(v, vehicleHeader, tz))}</li>`)
                 .join('');
+            const urlText = formatFormUrlsForText(formUrls);
+            const urlHtml = formatFormUrlsForHtml(formUrls);
             const subject = applyTemplate(settings.subjectTemplate, {
                 管理部門: dept,
                 対象開始日: formatDateLabel(targetStart || new Date(), tz),
                 対象終了日: formatDateLabel(targetEnd || new Date(), tz),
                 締切日: formatDateLabel(deadline || new Date(), tz),
-                URL: url,
+                URL: urlText,
             });
             const bodyText = applyTemplate(settings.bodyTemplate, {
                 管理部門: dept,
                 対象開始日: formatDateLabel(targetStart || new Date(), tz),
                 対象終了日: formatDateLabel(targetEnd || new Date(), tz),
                 締切日: formatDateLabel(deadline || new Date(), tz),
-                URL: url,
+                URL: urlText,
                 車両一覧: listText,
             });
             const htmlTemplate = applyTemplate(settings.bodyTemplate, {
@@ -497,11 +527,12 @@ function sendInitialEmails() {
                 対象開始日: formatDateLabel(targetStart || new Date(), tz),
                 対象終了日: formatDateLabel(targetEnd || new Date(), tz),
                 締切日: formatDateLabel(deadline || new Date(), tz),
-                URL: url,
+                URL: '[[FORM_URLS]]',
                 車両一覧: '[[VEHICLE_LIST]]',
             });
             const htmlBody = escapeHtml(htmlTemplate)
                 .replace(/\n/g, '<br>')
+                .replace('[[FORM_URLS]]', urlHtml)
                 .replace('[[VEHICLE_LIST]]', `<ul>${listHtml}</ul>`);
             try {
                 MailApp.sendEmail({
@@ -527,94 +558,59 @@ function sendInitialEmails() {
     }
 }
 function doGet(e) {
-    const params = e && e.parameter ? e.parameter : {};
-    const validation = validateRequestAccess(params);
-    if (!validation.ok) {
-        return HtmlService.createHtmlOutput(`<p>${escapeHtml(validation.message)}</p>`).setTitle('車両更新回答');
-    }
-    const request = validation.requestRow;
-    const vehicles = getVehiclesByRequestId(validation.requestId);
-    const answers = loadAnswersForRequest(validation.requestId);
-    const formRows = vehicles
-        .map((v, index) => buildAnswerRowHtml(v, answers[v.vehicleId], index))
-        .join('');
-    const html = `
-    <html>
-      <head>
-        <meta charset="utf-8">
-        <style>
-          body { font-family: sans-serif; }
-          table { border-collapse: collapse; width: 100%; }
-          th, td { border: 1px solid #ccc; padding: 6px; font-size: 14px; }
-          th { background: #f5f5f5; }
-          .muted { color: #777; }
-        </style>
-      </head>
-      <body>
-        <h2>車両更新方針 回答</h2>
-        <p>管理部門: ${escapeHtml(request.dept)}</p>
-        <p class="muted">requestId: ${escapeHtml(validation.requestId)}</p>
-        <form method="post">
-          <input type="hidden" name="requestId" value="${escapeHtml(validation.requestId)}">
-          <input type="hidden" name="token" value="${escapeHtml(validation.requestToken)}">
-          <input type="hidden" name="dept" value="${escapeHtml(request.dept)}">
-          <input type="hidden" name="deptToken" value="${escapeHtml(request.deptToken)}">
-          <p>
-            回答者（任意）: <input type="text" name="responder" value="">
-          </p>
-          <table>
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>車両</th>
-                <th>契約満了日</th>
-                <th>更新方針</th>
-                <th>コメント</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${formRows}
-            </tbody>
-          </table>
-          <p><button type="submit">回答を送信</button></p>
-        </form>
-      </body>
-    </html>
-  `;
-    return HtmlService.createHtmlOutput(html).setTitle('車両更新回答');
+    const message = 'このWeb回答ページは廃止されました。通知メール内のGoogleフォームからご回答ください。';
+    return HtmlService.createHtmlOutput(`<p>${escapeHtml(message)}</p>`).setTitle('車両更新回答');
 }
 function doPost(e) {
-    const params = e && e.parameter ? e.parameter : {};
-    const paramsArray = e && e.parameters ? e.parameters : {};
-    const validation = validateRequestAccess(params);
-    if (!validation.ok) {
-        return HtmlService.createHtmlOutput(`<p>${escapeHtml(validation.message)}</p>`).setTitle('車両更新回答');
-    }
-    const vehicleIds = ensureArray(paramsArray['vehicleId']);
-    const answers = ensureArray(paramsArray['answer']);
-    const comments = ensureArray(paramsArray['comment']);
-    const responder = params['responder'] ? String(params['responder']) : '';
-    const now = new Date();
-    const answerInputs = [];
-    for (let i = 0; i < vehicleIds.length; i++) {
-        const answer = answers[i] ? String(answers[i]) : '';
-        if (!answer)
-            continue;
-        answerInputs.push({
-            requestId: validation.requestId,
-            vehicleId: String(vehicleIds[i]),
-            answer,
-            comment: comments[i] ? String(comments[i]) : '',
-            responder,
+    const message = 'このWeb回答ページは廃止されました。通知メール内のGoogleフォームからご回答ください。';
+    return HtmlService.createHtmlOutput(`<p>${escapeHtml(message)}</p>`).setTitle('車両更新回答');
+}
+function onRequestFormSubmit(e) {
+    const lock = LockService.getDocumentLock();
+    lock.waitLock(30000);
+    try {
+        if (!e || !e.response) {
+            Logger.log('onRequestFormSubmit: response がありません');
+            return;
+        }
+        const formId = getFormIdFromEvent(e);
+        if (!formId) {
+            Logger.log('onRequestFormSubmit: formId を取得できません');
+            return;
+        }
+        const requestInfo = findRequestByFormId(formId);
+        if (!requestInfo) {
+            Logger.log(`onRequestFormSubmit: formId に紐づく依頼が見つかりません (${formId})`);
+            return;
+        }
+        const parsed = extractAnswersFromFormResponse(e.response);
+        const vehicleIds = Object.keys(parsed.answersByVehicleId);
+        if (vehicleIds.length === 0) {
+            Logger.log(`onRequestFormSubmit: 回答が空です (${requestInfo.requestId})`);
+            return;
+        }
+        const commentMap = parseVehicleComments(parsed.commentText, vehicleIds);
+        const useVehicleComments = Object.keys(commentMap).length > 0;
+        const now = new Date();
+        const answerInputs = vehicleIds.map((vehicleId) => ({
+            requestId: requestInfo.requestId,
+            vehicleId,
+            answer: parsed.answersByVehicleId[vehicleId],
+            comment: useVehicleComments ? commentMap[vehicleId] || '' : parsed.commentText || '',
+            responder: parsed.responder || '',
             answeredAt: now,
-        });
-    }
-    if (answerInputs.length > 0) {
+        }));
         upsertAnswers(answerInputs);
         applyAnswers();
-        updateRequestStatus(validation.requestId);
+        const status = updateRequestStatus(requestInfo.requestId);
+        buildSummarySheet();
+        if (status === REQUEST_STATUS.COMPLETED) {
+            closeRequestForms(requestInfo.requestId);
+        }
     }
-    return HtmlService.createHtmlOutput('<p>回答を受け付けました。ご協力ありがとうございました。</p>').setTitle('車両更新回答');
+    finally {
+        lock.releaseLock();
+    }
 }
 function applyAnswers() {
     const lock = LockService.getDocumentLock();
@@ -1895,6 +1891,330 @@ function escapeHtml(text) {
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
 }
+function formatDateIsoLabel(date, tz) {
+    return Utilities.formatDate(date, tz, 'yyyy-MM-dd');
+}
+function formatFormUrlsForText(urls) {
+    if (urls.length === 1)
+        return urls[0];
+    return urls.map((url, index) => `Part${index + 1}: ${url}`).join('\n');
+}
+function formatFormUrlsForHtml(urls) {
+    return urls
+        .map((url, index) => {
+        const label = urls.length > 1 ? `Part${index + 1}: ` : '';
+        const escaped = escapeHtml(url);
+        return `${label}<a href="${escaped}">${escaped}</a>`;
+    })
+        .join('<br>');
+}
+function extractFormUrlsFromRequestRow(row, headerMap) {
+    const urls = parseJsonStringArray(getCellValue(row, headerMap['formUrlsJson']));
+    if (urls.length > 0)
+        return urls;
+    const url = getCellValue(row, headerMap['formUrl']);
+    return url ? [String(url)] : [];
+}
+function applyFormResultToRequestRow(row, headerMap, result, createdAt) {
+    const setCell = (headerName, value) => {
+        const idx = headerMap[headerName];
+        if (idx)
+            row[idx - 1] = value;
+    };
+    setCell('formId', result.formIds.length === 1 ? result.formIds[0] : '');
+    setCell('formUrl', result.formUrls.length === 1 ? result.formUrls[0] : '');
+    setCell('formIdsJson', result.formIds.length > 1 ? JSON.stringify(result.formIds) : '');
+    setCell('formUrlsJson', result.formUrls.length > 1 ? JSON.stringify(result.formUrls) : '');
+    setCell('formEditUrl', result.formEditUrls.length === 1 ? result.formEditUrls[0] : '');
+    setCell('formTriggerId', result.formTriggerIds.length === 1 ? result.formTriggerIds[0] : '');
+    setCell('フォーム作成日時', createdAt);
+}
+function createRequestForms(params) {
+    try {
+        const chunks = chunkArray(params.vehicles, MAX_VEHICLES_PER_FORM);
+        const parts = chunks.length;
+        const formIds = [];
+        const formUrls = [];
+        const formEditUrls = [];
+        const formTriggerIds = [];
+        chunks.forEach((chunk, index) => {
+            const title = buildFormTitle(params.dept, params.requestId, index, parts);
+            const form = FormApp.create(title);
+            form.setDescription(buildFormDescription(params, index, parts, params.tz));
+            form.setConfirmationMessage('回答を受け付けました。ありがとうございました。');
+            const responderItem = form.addTextItem();
+            responderItem.setTitle(FORM_ITEM_TITLES.RESPONDER);
+            const gridItem = form.addGridItem();
+            gridItem.setTitle(FORM_ITEM_TITLES.POLICY_GRID);
+            gridItem.setRows(chunk.map((row) => buildFormVehicleRowLabel(row, params.vehicleHeader, params.tz)));
+            gridItem.setColumns(ANSWER_OPTIONS);
+            gridItem.setRequired(true);
+            const commentItem = form.addParagraphTextItem();
+            commentItem.setTitle(FORM_ITEM_TITLES.COMMENT);
+            const trigger = ScriptApp.newTrigger('onRequestFormSubmit').forForm(form).onFormSubmit().create();
+            const triggerId = typeof trigger.getUniqueId === 'function' ? trigger.getUniqueId() : '';
+            formIds.push(form.getId());
+            formUrls.push(form.getPublishedUrl());
+            formEditUrls.push(form.getEditUrl());
+            formTriggerIds.push(triggerId);
+        });
+        return {
+            ok: true,
+            message: '',
+            formIds,
+            formUrls,
+            formEditUrls,
+            formTriggerIds,
+        };
+    }
+    catch (err) {
+        return {
+            ok: false,
+            message: err ? String(err) : 'フォーム作成に失敗しました',
+            formIds: [],
+            formUrls: [],
+            formEditUrls: [],
+            formTriggerIds: [],
+        };
+    }
+}
+function buildFormTitle(dept, requestId, index, total) {
+    let title = `【車両更新方針】${dept} ${requestId}`;
+    if (total > 1) {
+        title += ` Part${index + 1}/${total}`;
+    }
+    return title;
+}
+function buildFormDescription(params, index, total, tz) {
+    const startLabel = params.targetStart ? formatDateLabel(params.targetStart, tz) : formatDateLabel(new Date(), tz);
+    const endLabel = params.targetEnd ? formatDateLabel(params.targetEnd, tz) : formatDateLabel(new Date(), tz);
+    const deadlineLabel = params.deadline ? formatDateLabel(params.deadline, tz) : formatDateLabel(new Date(), tz);
+    const lines = [
+        total > 1 ? `Part${index + 1}/${total}` : '',
+        `対象期間: ${startLabel}〜${endLabel}`,
+        `締切: ${deadlineLabel}`,
+        '※このフォームのURLは転送しないでください。',
+    ].filter((line) => line);
+    return lines.join('\n');
+}
+function buildFormVehicleRowLabel(row, headerMap, tz) {
+    const vehicleId = getCellValue(row, headerMap['vehicleId']);
+    const display = formatFormVehicleLine(row, headerMap, tz);
+    return `|${vehicleId}| ${display}`;
+}
+function formatFormVehicleLine(row, headerMap, tz) {
+    const reg = getCellValue(row, headerMap['登録番号_結合']) || '登録番号不明';
+    const chassis = getCellValue(row, headerMap['車台番号']) || '車台番号不明';
+    const end = parseDateValue(getCellRaw(row, headerMap['契約満了日']));
+    const endLabel = end ? formatDateIsoLabel(end, tz) : '未設定';
+    return `${reg} / ${chassis} / 満了日:${endLabel}`;
+}
+function getFormIdFromEvent(e) {
+    try {
+        if (e && e.source && typeof e.source.getId === 'function') {
+            return e.source.getId();
+        }
+    }
+    catch (err) {
+        Logger.log(`getFormIdFromEvent: ${err}`);
+    }
+    try {
+        const response = e && e.response;
+        if (response && typeof response.getFormId === 'function') {
+            return response.getFormId();
+        }
+    }
+    catch (err) {
+        Logger.log(`getFormIdFromEvent response: ${err}`);
+    }
+    return '';
+}
+function findRequestByFormId(formId) {
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.REQUESTS);
+    if (!sheet)
+        return null;
+    const data = sheet.getDataRange().getValues();
+    if (data.length <= 1)
+        return null;
+    const headerMap = getHeaderMap(data[0]);
+    const requestIdIndex = headerMap['requestId'];
+    const formIdIndex = headerMap['formId'];
+    const formIdsJsonIndex = headerMap['formIdsJson'];
+    for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        if (formIdIndex) {
+            const rowFormId = getCellValue(row, formIdIndex);
+            if (rowFormId && rowFormId === formId) {
+                return { requestId: getCellValue(row, requestIdIndex), rowIndex: i + 1 };
+            }
+        }
+        if (formIdsJsonIndex) {
+            const ids = parseJsonStringArray(getCellValue(row, formIdsJsonIndex));
+            if (ids.indexOf(formId) >= 0) {
+                return { requestId: getCellValue(row, requestIdIndex), rowIndex: i + 1 };
+            }
+        }
+    }
+    return null;
+}
+function extractAnswersFromFormResponse(response) {
+    const result = {
+        responder: '',
+        commentText: '',
+        answersByVehicleId: {},
+    };
+    const itemResponses = response.getItemResponses();
+    itemResponses.forEach((itemResponse) => {
+        const item = itemResponse.getItem();
+        const title = item.getTitle();
+        const type = item.getType();
+        if (title === FORM_ITEM_TITLES.RESPONDER) {
+            result.responder = String(itemResponse.getResponse() || '').trim();
+            return;
+        }
+        if (title === FORM_ITEM_TITLES.COMMENT) {
+            result.commentText = String(itemResponse.getResponse() || '').trim();
+            return;
+        }
+        if (type === FormApp.ItemType.GRID) {
+            const gridAnswers = extractAnswersFromGridItem(item, itemResponse);
+            Object.keys(gridAnswers).forEach((vehicleId) => {
+                result.answersByVehicleId[vehicleId] = gridAnswers[vehicleId];
+            });
+        }
+    });
+    return result;
+}
+function extractAnswersFromGridItem(item, itemResponse) {
+    const answers = {};
+    let rows = [];
+    try {
+        rows = item.asGridItem().getRows();
+    }
+    catch (err) {
+        return answers;
+    }
+    const response = itemResponse.getResponse();
+    if (Array.isArray(response)) {
+        rows.forEach((rowLabel, index) => {
+            const answer = response[index];
+            const vehicleId = extractVehicleIdFromRowLabel(rowLabel);
+            if (vehicleId && answer) {
+                answers[vehicleId] = Array.isArray(answer) ? String(answer[0] || '') : String(answer);
+            }
+        });
+        return answers;
+    }
+    if (response && typeof response === 'object') {
+        Object.keys(response).forEach((rowLabel) => {
+            const answer = response[rowLabel];
+            const vehicleId = extractVehicleIdFromRowLabel(rowLabel);
+            if (vehicleId && answer) {
+                answers[vehicleId] = Array.isArray(answer) ? String(answer[0] || '') : String(answer);
+            }
+        });
+        return answers;
+    }
+    return answers;
+}
+function extractVehicleIdFromRowLabel(label) {
+    const match = String(label || '').match(/\|([^|]+)\|/);
+    return match ? match[1].trim() : '';
+}
+function parseVehicleComments(commentText, vehicleIds) {
+    const map = {};
+    if (!commentText)
+        return map;
+    const lines = String(commentText)
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line);
+    lines.forEach((line) => {
+        const match = line.match(/^([^:：]+)[:：]\s*(.+)$/);
+        if (!match)
+            return;
+        const vehicleId = match[1].trim();
+        if (vehicleIds.indexOf(vehicleId) === -1)
+            return;
+        const comment = match[2].trim();
+        if (comment)
+            map[vehicleId] = comment;
+    });
+    return map;
+}
+function parseJsonStringArray(value) {
+    if (value === null || value === undefined || value === '')
+        return [];
+    if (Array.isArray(value))
+        return value.map((v) => String(v));
+    try {
+        const parsed = JSON.parse(String(value));
+        if (Array.isArray(parsed))
+            return parsed.map((v) => String(v));
+    }
+    catch (err) {
+        return [];
+    }
+    return [];
+}
+function chunkArray(items, size) {
+    const result = [];
+    if (!items || items.length === 0)
+        return result;
+    const chunkSize = Math.max(1, Math.floor(size));
+    for (let i = 0; i < items.length; i += chunkSize) {
+        result.push(items.slice(i, i + chunkSize));
+    }
+    return result;
+}
+function closeRequestForms(requestId) {
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.REQUESTS);
+    if (!sheet)
+        return;
+    const data = sheet.getDataRange().getValues();
+    if (data.length <= 1)
+        return;
+    const headerMap = getHeaderMap(data[0]);
+    const requestIdIndex = headerMap['requestId'];
+    const formIdIndex = headerMap['formId'];
+    const formIdsJsonIndex = headerMap['formIdsJson'];
+    let formIds = [];
+    for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        if (getCellValue(row, requestIdIndex) !== requestId)
+            continue;
+        if (formIdIndex) {
+            const formId = getCellValue(row, formIdIndex);
+            if (formId)
+                formIds.push(String(formId));
+        }
+        if (formIdsJsonIndex) {
+            formIds = formIds.concat(parseJsonStringArray(getCellValue(row, formIdsJsonIndex)));
+        }
+        break;
+    }
+    formIds = Array.from(new Set(formIds.filter((id) => id)));
+    if (formIds.length === 0)
+        return;
+    formIds.forEach((formId) => {
+        try {
+            const form = FormApp.openById(formId);
+            form.setAcceptingResponses(false);
+        }
+        catch (err) {
+            Logger.log(`closeRequestForms: ${formId} ${err}`);
+        }
+    });
+    const triggers = ScriptApp.getProjectTriggers();
+    triggers.forEach((trigger) => {
+        if (trigger.getHandlerFunction() !== 'onRequestFormSubmit')
+            return;
+        const sourceId = typeof trigger.getTriggerSourceId === 'function' ? trigger.getTriggerSourceId() : '';
+        if (sourceId && formIds.indexOf(sourceId) >= 0) {
+            ScriptApp.deleteTrigger(trigger);
+        }
+    });
+}
 function appendNotificationLog(type, dept, to, requestId, result) {
     const ss = getSpreadsheet();
     const sheet = ensureSheet(ss, SHEET_NAMES.NOTIFY_LOG);
@@ -2066,10 +2386,10 @@ function updateRequestStatus(requestId) {
     const requestSheet = ss.getSheetByName(SHEET_NAMES.REQUESTS);
     const vehicleSheet = ss.getSheetByName(SHEET_NAMES.VEHICLE_VIEW);
     if (!requestSheet || !vehicleSheet)
-        return;
+        return '';
     const requestData = requestSheet.getDataRange().getValues();
     if (requestData.length <= 1)
-        return;
+        return '';
     const requestHeader = getHeaderMap(requestData[0]);
     const vehicleData = vehicleSheet.getDataRange().getValues();
     const vehicleHeader = getHeaderMap(vehicleData[0]);
@@ -2098,6 +2418,7 @@ function updateRequestStatus(requestId) {
         }
     }
     requestSheet.getRange(1, 1, requestData.length, requestData[0].length).setValues(requestData);
+    return newStatus;
 }
 function ensureAppendColumns(sheet, headers) {
     const headerRow = 1;
