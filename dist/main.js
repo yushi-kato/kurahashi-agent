@@ -28,6 +28,7 @@ const FORM_ITEM_TITLES = {
     POLICY_GRID: '更新方針（車両ごと）',
     COMMENT: 'コメント（任意）',
 };
+const FORM_VEHICLE_IDS_PROP_PREFIX = 'FORM_VEHICLE_IDS__';
 const SCHEMA_DEFS = [
     {
         name: SHEET_NAMES.SETTINGS,
@@ -788,7 +789,7 @@ function onRequestFormSubmit(e) {
             Logger.log(`onRequestFormSubmit: formId に紐づく依頼が見つかりません (${formId})`);
             return;
         }
-        const parsed = extractAnswersFromFormResponse(e.response);
+        const parsed = extractAnswersFromFormResponse(formId, e.response);
         const vehicleIds = Object.keys(parsed.answersByVehicleId);
         if (vehicleIds.length === 0) {
             Logger.log(`onRequestFormSubmit: 回答が空です (${requestInfo.requestId})`);
@@ -2143,20 +2144,35 @@ function createRequestForms(params) {
         const formUrls = [];
         const formEditUrls = [];
         const formTriggerIds = [];
+        const props = PropertiesService.getDocumentProperties();
         chunks.forEach((chunk, index) => {
             const title = buildFormTitle(params.dept, params.requestId, index, parts);
             const form = FormApp.create(title);
+            form.setRequireLogin(false);
+            form.setCollectEmail(false);
+            form.setLimitOneResponsePerUser(false);
+            form.setShowLinkToRespondAgain(false);
             form.setDescription(buildFormDescription(params, index, parts, params.tz));
             form.setConfirmationMessage('回答を受け付けました。ありがとうございました。');
+            const header = form.addSectionHeaderItem();
+            header.setTitle('ご回答方法');
+            header.setHelpText([
+                '1) 「更新方針（車両ごと）」は必須です（未定も選べます）。',
+                '2) 車両の並びは、通知メールの一覧と同じ順です。',
+                '3) 「コメント（任意）」は全体コメント、または「1: コメント」のように番号で車両別コメントも書けます。',
+                '※このフォームのURLは転送しないでください。',
+            ].join('\n'));
             const responderItem = form.addTextItem();
             responderItem.setTitle(FORM_ITEM_TITLES.RESPONDER);
             const gridItem = form.addGridItem();
             gridItem.setTitle(FORM_ITEM_TITLES.POLICY_GRID);
-            gridItem.setRows(chunk.map((row) => buildFormVehicleRowLabel(row, params.vehicleHeader, params.tz)));
+            gridItem.setRows(chunk.map((row, rowIndex) => buildFormVehicleRowLabel(row, params.vehicleHeader, params.tz, rowIndex)));
             gridItem.setColumns(ANSWER_OPTIONS);
             gridItem.setRequired(true);
             const commentItem = form.addParagraphTextItem();
             commentItem.setTitle(FORM_ITEM_TITLES.COMMENT);
+            const vehicleIds = chunk.map((row) => getCellValue(row, params.vehicleHeader['vehicleId']) || '');
+            props.setProperty(buildFormVehicleIdsPropKey(form.getId()), JSON.stringify(vehicleIds));
             const trigger = ScriptApp.newTrigger('onRequestFormSubmit').forForm(form).onFormSubmit().create();
             const triggerId = typeof trigger.getUniqueId === 'function' ? trigger.getUniqueId() : '';
             formIds.push(form.getId());
@@ -2203,17 +2219,16 @@ function buildFormDescription(params, index, total, tz) {
     ].filter((line) => line);
     return lines.join('\n');
 }
-function buildFormVehicleRowLabel(row, headerMap, tz) {
-    const vehicleId = getCellValue(row, headerMap['vehicleId']);
-    const display = formatFormVehicleLine(row, headerMap, tz);
-    return `|${vehicleId}| ${display}`;
+function buildFormVehicleRowLabel(row, headerMap, tz, rowIndex) {
+    const display = formatFormVehicleLineShort(row, headerMap, tz, rowIndex);
+    return display;
 }
-function formatFormVehicleLine(row, headerMap, tz) {
-    const reg = getCellValue(row, headerMap['登録番号_結合']) || '登録番号不明';
-    const chassis = getCellValue(row, headerMap['車台番号']) || '車台番号不明';
+function formatFormVehicleLineShort(row, headerMap, tz, rowIndex) {
+    const reg = getCellValue(row, headerMap['登録番号_結合']);
+    const label = reg || `車両${rowIndex + 1}`;
     const end = parseDateValue(getCellRaw(row, headerMap['契約満了日']));
     const endLabel = end ? formatDateIsoLabel(end, tz) : '未設定';
-    return `${reg} / ${chassis} / 満了日:${endLabel}`;
+    return `【${rowIndex + 1}】${label}（満了日:${endLabel}）`;
 }
 function getFormIdFromEvent(e) {
     try {
@@ -2263,12 +2278,13 @@ function findRequestByFormId(formId) {
     }
     return null;
 }
-function extractAnswersFromFormResponse(response) {
+function extractAnswersFromFormResponse(formId, response) {
     const result = {
         responder: '',
         commentText: '',
         answersByVehicleId: {},
     };
+    const vehicleIdsForForm = loadVehicleIdsForForm(formId);
     const itemResponses = response.getItemResponses();
     itemResponses.forEach((itemResponse) => {
         const item = itemResponse.getItem();
@@ -2283,7 +2299,7 @@ function extractAnswersFromFormResponse(response) {
             return;
         }
         if (type === FormApp.ItemType.GRID) {
-            const gridAnswers = extractAnswersFromGridItem(item, itemResponse);
+            const gridAnswers = extractAnswersFromGridItem(item, itemResponse, vehicleIdsForForm);
             Object.keys(gridAnswers).forEach((vehicleId) => {
                 result.answersByVehicleId[vehicleId] = gridAnswers[vehicleId];
             });
@@ -2291,7 +2307,7 @@ function extractAnswersFromFormResponse(response) {
     });
     return result;
 }
-function extractAnswersFromGridItem(item, itemResponse) {
+function extractAnswersFromGridItem(item, itemResponse, vehicleIdsForForm) {
     const answers = {};
     let rows = [];
     try {
@@ -2304,7 +2320,7 @@ function extractAnswersFromGridItem(item, itemResponse) {
     if (Array.isArray(response)) {
         rows.forEach((rowLabel, index) => {
             const answer = response[index];
-            const vehicleId = extractVehicleIdFromRowLabel(rowLabel);
+            const vehicleId = (vehicleIdsForForm && vehicleIdsForForm[index]) ? vehicleIdsForForm[index] : extractVehicleIdFromRowLabel(rowLabel);
             if (vehicleId && answer) {
                 answers[vehicleId] = Array.isArray(answer) ? String(answer[0] || '') : String(answer);
             }
@@ -2314,7 +2330,10 @@ function extractAnswersFromGridItem(item, itemResponse) {
     if (response && typeof response === 'object') {
         Object.keys(response).forEach((rowLabel) => {
             const answer = response[rowLabel];
-            const vehicleId = extractVehicleIdFromRowLabel(rowLabel);
+            const rowIndex = rows.indexOf(rowLabel);
+            const vehicleId = rowIndex >= 0 && vehicleIdsForForm && vehicleIdsForForm[rowIndex]
+                ? vehicleIdsForForm[rowIndex]
+                : extractVehicleIdFromRowLabel(rowLabel);
             if (vehicleId && answer) {
                 answers[vehicleId] = Array.isArray(answer) ? String(answer[0] || '') : String(answer);
             }
@@ -2339,7 +2358,9 @@ function parseVehicleComments(commentText, vehicleIds) {
         const match = line.match(/^([^:：]+)[:：]\s*(.+)$/);
         if (!match)
             return;
-        const vehicleId = match[1].trim();
+        const key = match[1].trim();
+        const num = key.match(/^\d+$/) ? Number(key) : 0;
+        const vehicleId = num > 0 && num <= vehicleIds.length ? vehicleIds[num - 1] : key;
         if (vehicleIds.indexOf(vehicleId) === -1)
             return;
         const comment = match[2].trim();
@@ -2347,6 +2368,15 @@ function parseVehicleComments(commentText, vehicleIds) {
             map[vehicleId] = comment;
     });
     return map;
+}
+function buildFormVehicleIdsPropKey(formId) {
+    return `${FORM_VEHICLE_IDS_PROP_PREFIX}${formId}`;
+}
+function loadVehicleIdsForForm(formId) {
+    const raw = PropertiesService.getDocumentProperties().getProperty(buildFormVehicleIdsPropKey(formId));
+    if (!raw)
+        return [];
+    return parseJsonStringArray(raw);
 }
 function parseJsonStringArray(value) {
     if (value === null || value === undefined || value === '')
@@ -2402,6 +2432,7 @@ function closeRequestForms(requestId) {
     formIds = Array.from(new Set(formIds.filter((id) => id)));
     if (formIds.length === 0)
         return;
+    const props = PropertiesService.getDocumentProperties();
     formIds.forEach((formId) => {
         try {
             const form = FormApp.openById(formId);
@@ -2409,6 +2440,12 @@ function closeRequestForms(requestId) {
         }
         catch (err) {
             Logger.log(`closeRequestForms: ${formId} ${err}`);
+        }
+        try {
+            props.deleteProperty(buildFormVehicleIdsPropKey(formId));
+        }
+        catch (err) {
+            Logger.log(`closeRequestForms deleteProperty: ${formId} ${err}`);
         }
     });
     const triggers = ScriptApp.getProjectTriggers();
