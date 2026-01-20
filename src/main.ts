@@ -33,6 +33,7 @@ const FORM_ITEM_TITLES = {
   COMMENT: 'コメント（任意）',
 };
 const FORM_VEHICLE_IDS_PROP_PREFIX = 'FORM_VEHICLE_IDS__';
+const VIEW_SHEET_PROTECTION_DESC_PREFIX = 'managed_by_script:view_sheet:';
 
 const SCHEMA_DEFS = [
   {
@@ -286,6 +287,7 @@ function syncVehicles() {
     const needsInputRows: any[][] = [];
     const now = new Date();
     const tz = ss.getSpreadsheetTimeZone();
+    const seenVehicleId: { [vehicleId: string]: { sheet: string; rowIndex: number } } = {};
 
     SOURCE_SHEETS.forEach((sheetName) => {
       const sheet = ss.getSheetByName(sheetName);
@@ -317,6 +319,21 @@ function syncVehicles() {
         const vehicleId = buildVehicleId(sheetName, regCombined, chassis, i + 1);
         const existing = existingByVehicleId[vehicleId] || { policy: '', requestId: '', answeredAt: '', note: '' };
 
+        if (seenVehicleId[vehicleId]) {
+          const prev = seenVehicleId[vehicleId];
+          needsInputRows.push([
+            now,
+            sheetName,
+            vehicleId,
+            dept,
+            regCombined,
+            vehicleType,
+            `vehicleId重複（先頭: ${prev.sheet} 行${prev.rowIndex} / 今回: 行${i + 1}）`,
+          ]);
+        } else {
+          seenVehicleId[vehicleId] = { sheet: sheetName, rowIndex: i + 1 };
+        }
+
         if (!contractEnd) {
           needsInputRows.push([now, sheetName, vehicleId, dept, regCombined, vehicleType, '契約満了日なし']);
         }
@@ -324,6 +341,13 @@ function syncVehicles() {
           needsInputRows.push([now, sheetName, vehicleId, dept, regCombined, vehicleType, '管理部門なし']);
         } else if (!deptMaster[dept]) {
           needsInputRows.push([now, sheetName, vehicleId, dept, regCombined, vehicleType, '部署マスタ未登録']);
+        }
+        if (regCombined && !/\d/.test(String(regCombined))) {
+          if (!chassis) {
+            needsInputRows.push([now, sheetName, vehicleId, dept, regCombined, vehicleType, '登録番号が不完全（数字なし）かつ車台番号なし']);
+          } else {
+            needsInputRows.push([now, sheetName, vehicleId, dept, regCombined, vehicleType, '登録番号が不完全（数字なし）']);
+          }
         }
 
         rows.push([
@@ -349,6 +373,8 @@ function syncVehicles() {
 
     writeSheetData(SHEET_NAMES.VEHICLE_VIEW, rows);
     writeSheetData(SHEET_NAMES.NEEDS_INPUT, needsInputRows);
+    protectViewSheet(SHEET_NAMES.VEHICLE_VIEW);
+    protectViewSheet(SHEET_NAMES.NEEDS_INPUT);
   } finally {
     lock.releaseLock();
   }
@@ -2075,8 +2101,13 @@ function buildRegistrationCombined(area: string, cls: string, kana: string, numb
 }
 
 function buildVehicleId(sourceSheet: string, regCombined: string, chassis: string, rowIndex: number) {
-  const base = regCombined || chassis || `ROW${rowIndex}`;
-  return `${sourceSheet}__${base}`;
+  const reg = String(regCombined || '').trim();
+  const ch = String(chassis || '').trim();
+  const hasDigit = /\d/.test(reg);
+  if (reg && hasDigit) return `${sourceSheet}__${reg}`;
+  if (ch) return `${sourceSheet}__${ch}`;
+  if (reg) return `${sourceSheet}__${reg}__ROW${rowIndex}`;
+  return `${sourceSheet}__ROW${rowIndex}`;
 }
 
 function loadDeptMaster(): DeptMaster {
@@ -2769,6 +2800,45 @@ function closeRequestForms(requestId: string) {
       ScriptApp.deleteTrigger(trigger);
     }
   });
+}
+
+function protectViewSheet(sheetName: string) {
+  const ss = getSpreadsheet();
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return;
+
+  try {
+    const desc = `${VIEW_SHEET_PROTECTION_DESC_PREFIX}${sheetName}`;
+    const protections = sheet.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+    let protection = protections.find((p) => p.getDescription() === desc);
+    if (!protection) {
+      protection = sheet.protect();
+      protection.setDescription(desc);
+    }
+
+    protection.setWarningOnly(false);
+    protection.setDomainEdit(false);
+
+    try {
+      const editors = protection.getEditors();
+      if (editors && editors.length > 0) protection.removeEditors(editors);
+    } catch (err) {
+      Logger.log(`protectViewSheet removeEditors: ${sheetName} ${err}`);
+    }
+
+    try {
+      protection.addEditor(Session.getEffectiveUser());
+    } catch (err) {
+      Logger.log(`protectViewSheet add effective user: ${sheetName} ${err}`);
+    }
+    try {
+      protection.addEditor(Session.getActiveUser());
+    } catch (err) {
+      Logger.log(`protectViewSheet add active user: ${sheetName} ${err}`);
+    }
+  } catch (err) {
+    Logger.log(`protectViewSheet: ${sheetName} ${err}`);
+  }
 }
 
 function appendNotificationLog(type: string, dept: string, to: string, requestId: string, result: string) {
