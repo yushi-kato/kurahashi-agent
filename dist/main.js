@@ -153,6 +153,7 @@ function onOpen() {
         .addItem('車両統合ビュー同期', 'syncVehicles')
         .addItem('更新依頼作成', 'createRequests')
         .addItem('初回メール送信', 'sendInitialEmails')
+        .addItem('リマインド送信', 'sendReminderEmails')
         .addSeparator()
         .addItem('回答反映', 'applyAnswers')
         .addItem('回答集計更新', 'buildSummarySheet')
@@ -557,6 +558,210 @@ function sendInitialEmails() {
         lock.releaseLock();
     }
 }
+function sendReminderEmails() {
+    const lock = LockService.getDocumentLock();
+    lock.waitLock(30000);
+    try {
+        const ss = getSpreadsheet();
+        const settings = loadSettings();
+        if (!settings.mailSendEnabled) {
+            appendNotificationLog('リマインド', '', '', '', '通知_メール送信=FALSE のため送信をスキップ');
+            return;
+        }
+        if (settings.reminderMaxCount <= 0)
+            return;
+        const deptMaster = loadDeptMaster();
+        const requestSheet = ss.getSheetByName(SHEET_NAMES.REQUESTS);
+        const vehicleSheet = ss.getSheetByName(SHEET_NAMES.VEHICLE_VIEW);
+        if (!requestSheet || !vehicleSheet)
+            throw new Error('必要シートが存在しません');
+        const requestData = requestSheet.getDataRange().getValues();
+        if (requestData.length <= 1)
+            return;
+        const reqHeader = getHeaderMap(requestData[0]);
+        const vehicleData = vehicleSheet.getDataRange().getValues();
+        if (vehicleData.length <= 1)
+            return;
+        const vehicleHeader = getHeaderMap(vehicleData[0]);
+        const tz = ss.getSpreadsheetTimeZone();
+        const today = toDateOnly(new Date(), tz);
+        const now = new Date();
+        const notifiedOverdue = loadNotifiedRequestIds('期限超過');
+        for (let i = 1; i < requestData.length; i++) {
+            const row = requestData[i];
+            const requestId = getCellValue(row, reqHeader['requestId']);
+            if (!requestId)
+                continue;
+            const dept = getCellValue(row, reqHeader['管理部門']);
+            const deptInfo = deptMaster[dept];
+            if (!deptInfo || !deptInfo.active)
+                continue;
+            const initialSentAt = parseDateValue(getCellRaw(row, reqHeader['初回送信日時']));
+            if (!initialSentAt)
+                continue;
+            const vehicles = vehicleData
+                .slice(1)
+                .filter((v) => getCellValue(v, vehicleHeader['依頼ID']) === requestId);
+            if (vehicles.length === 0)
+                continue;
+            const unansweredVehicles = vehicles.filter((v) => !getCellValue(v, vehicleHeader['更新方針']));
+            if (unansweredVehicles.length === 0) {
+                continue;
+            }
+            const answeredCount = vehicles.length - unansweredVehicles.length;
+            row[reqHeader['ステータス'] - 1] = answeredCount > 0 ? REQUEST_STATUS.RESPONDING : REQUEST_STATUS.SENT;
+            const deadline = parseDateValue(getCellRaw(row, reqHeader['締切日']));
+            if (deadline) {
+                const deadlineDate = toDateOnly(deadline, tz);
+                if (today.getTime() > deadlineDate.getTime()) {
+                    if (!notifiedOverdue[requestId]) {
+                        notifyAdminOverdue({
+                            requestId,
+                            dept,
+                            deadline,
+                            unanswered: unansweredVehicles.length,
+                            total: vehicles.length,
+                            settings,
+                            tz,
+                        });
+                        notifiedOverdue[requestId] = true;
+                    }
+                    continue;
+                }
+            }
+            const status = getCellValue(row, reqHeader['ステータス']);
+            if (status !== REQUEST_STATUS.SENT && status !== REQUEST_STATUS.RESPONDING)
+                continue;
+            const reminderCount = toNumber(getCellRaw(row, reqHeader['リマインド回数']), 0);
+            if (reminderCount >= settings.reminderMaxCount)
+                continue;
+            const lastReminderAt = parseDateValue(getCellRaw(row, reqHeader['最終リマインド日時']));
+            if (lastReminderAt && toDateOnly(lastReminderAt, tz).getTime() === today.getTime())
+                continue;
+            const eligibleFrom = reminderCount === 0 || !lastReminderAt
+                ? addDays(toDateOnly(initialSentAt, tz), settings.reminderStartAfterDays)
+                : addDays(toDateOnly(lastReminderAt, tz), settings.reminderIntervalDays);
+            if (today.getTime() < eligibleFrom.getTime())
+                continue;
+            const targetStart = parseDateValue(getCellRaw(row, reqHeader['対象開始日']));
+            const targetEnd = parseDateValue(getCellRaw(row, reqHeader['対象終了日']));
+            const formUrls = extractFormUrlsFromRequestRow(row, reqHeader);
+            if (formUrls.length === 0) {
+                appendNotificationLog('リマインド', dept, deptInfo.to, requestId, 'フォームURLが未設定');
+                continue;
+            }
+            if (!deptInfo.to) {
+                appendNotificationLog('リマインド', dept, '', requestId, '通知先Toが未設定');
+                continue;
+            }
+            const listText = unansweredVehicles
+                .map((v) => formatVehicleLine(v, vehicleHeader, tz))
+                .join('\n');
+            const listHtml = unansweredVehicles
+                .map((v) => `<li>${escapeHtml(formatVehicleLine(v, vehicleHeader, tz))}</li>`)
+                .join('');
+            const urlText = formatFormUrlsForText(formUrls);
+            const urlHtml = formatFormUrlsForHtml(formUrls);
+            const subjectBase = applyTemplate(settings.subjectTemplate, {
+                管理部門: dept,
+                対象開始日: formatDateLabel(targetStart || new Date(), tz),
+                対象終了日: formatDateLabel(targetEnd || new Date(), tz),
+                締切日: formatDateLabel(deadline || new Date(), tz),
+                URL: urlText,
+            });
+            const subject = `【リマインド】${subjectBase}`;
+            const bodyText = applyTemplate(settings.bodyTemplate, {
+                管理部門: dept,
+                対象開始日: formatDateLabel(targetStart || new Date(), tz),
+                対象終了日: formatDateLabel(targetEnd || new Date(), tz),
+                締切日: formatDateLabel(deadline || new Date(), tz),
+                URL: urlText,
+                車両一覧: listText,
+            });
+            const htmlTemplate = applyTemplate(settings.bodyTemplate, {
+                管理部門: dept,
+                対象開始日: formatDateLabel(targetStart || new Date(), tz),
+                対象終了日: formatDateLabel(targetEnd || new Date(), tz),
+                締切日: formatDateLabel(deadline || new Date(), tz),
+                URL: '[[FORM_URLS]]',
+                車両一覧: '[[VEHICLE_LIST]]',
+            });
+            const htmlBody = escapeHtml(htmlTemplate)
+                .replace(/\n/g, '<br>')
+                .replace('[[FORM_URLS]]', urlHtml)
+                .replace('[[VEHICLE_LIST]]', `<ul>${listHtml}</ul>`);
+            try {
+                MailApp.sendEmail({
+                    to: deptInfo.to,
+                    cc: deptInfo.cc,
+                    subject,
+                    name: settings.fromName,
+                    htmlBody,
+                    body: bodyText,
+                });
+                row[reqHeader['最終リマインド日時'] - 1] = now;
+                row[reqHeader['リマインド回数'] - 1] = reminderCount + 1;
+                appendNotificationLog('リマインド', dept, deptInfo.to, requestId, '成功');
+            }
+            catch (err) {
+                appendNotificationLog('リマインド', dept, deptInfo.to, requestId, `失敗: ${err}`);
+            }
+        }
+        requestSheet.getRange(1, 1, requestData.length, requestData[0].length).setValues(requestData);
+    }
+    finally {
+        lock.releaseLock();
+    }
+}
+function loadNotifiedRequestIds(type) {
+    const ss = getSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAMES.NOTIFY_LOG);
+    if (!sheet || sheet.getLastRow() <= 1)
+        return {};
+    const data = sheet.getDataRange().getValues();
+    if (data.length <= 1)
+        return {};
+    const headerMap = getHeaderMap(data[0]);
+    const result = {};
+    for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        if (getCellValue(row, headerMap['種別']) !== type)
+            continue;
+        const requestId = getCellValue(row, headerMap['requestId']);
+        if (requestId)
+            result[requestId] = true;
+    }
+    return result;
+}
+function notifyAdminOverdue(params) {
+    const to = params.settings.adminTo;
+    if (!to) {
+        appendNotificationLog('期限超過', params.dept, '', params.requestId, '管理者_通知先Toが未設定');
+        return;
+    }
+    const deadlineLabel = formatDateLabel(params.deadline, params.tz);
+    const subject = `【車両更新】期限超過: ${params.dept}（締切 ${deadlineLabel}）`;
+    const body = [
+        '更新依頼が締切日を超過しました（フォームは閉じません）。',
+        `管理部門: ${params.dept}`,
+        `requestId: ${params.requestId}`,
+        `締切日: ${deadlineLabel}`,
+        `未回答: ${params.unanswered} / 総件数: ${params.total}`,
+    ].join('\n');
+    try {
+        MailApp.sendEmail({
+            to,
+            cc: params.settings.adminCc,
+            subject,
+            name: params.settings.fromName,
+            body,
+        });
+        appendNotificationLog('期限超過', params.dept, to, params.requestId, '成功');
+    }
+    catch (err) {
+        appendNotificationLog('期限超過', params.dept, to, params.requestId, `失敗: ${err}`);
+    }
+}
 function doGet(e) {
     const message = 'このWeb回答ページは廃止されました。通知メール内のGoogleフォームからご回答ください。';
     return HtmlService.createHtmlOutput(`<p>${escapeHtml(message)}</p>`).setTitle('車両更新回答');
@@ -813,6 +1018,7 @@ function runDaily() {
     syncVehicles();
     createRequests();
     sendInitialEmails();
+    sendReminderEmails();
     buildSummarySheet();
     sendSummaryEmail();
 }
