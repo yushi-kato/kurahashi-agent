@@ -2,7 +2,7 @@
   "name": "kurahashi-gas",
   "private": true,
   "scripts": {
-    "build": "tsc && cp src/appsscript.json dist/appsscript.json"
+    "build": "tsc && node scripts/build-operation-manual.mjs && cp src/appsscript.json dist/appsscript.json"
   },
   "devDependencies": {
     "@types/google-apps-script": "^1.0.83",

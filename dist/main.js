@@ -133,6 +133,7 @@ const PROP_KEYS = {
 function onOpen() {
     const ui = SpreadsheetApp.getUi();
     ui.createMenu('車両更新通知')
+        .addItem('運用マニュアル（このシートで見る）', 'showOperationManual')
         .addItem('スキーマ同期', 'syncSchema')
         .addItem('スキーマドリフト確認', 'checkSchemaDrift')
         .addSeparator()
@@ -154,6 +155,13 @@ function onOpen() {
         .addSeparator()
         .addItem('日次一括実行', 'runDaily')
         .addToUi();
+}
+function showOperationManual() {
+    const ui = SpreadsheetApp.getUi();
+    const html = HtmlService.createHtmlOutputFromFile('operation_manual_vehicle_lease_renewal')
+        .setWidth(1000)
+        .setHeight(800);
+    ui.showModalDialog(html, '運用マニュアル');
 }
 function uiAlertSafe(message) {
     try {
