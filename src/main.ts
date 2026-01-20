@@ -262,6 +262,9 @@ function syncVehicles() {
       const existingHeader = getHeaderMap(existingData[0]);
       const idxExisting = {
         vehicleId: existingHeader['vehicleId'],
+        sourceSheet: existingHeader['sourceSheet'],
+        regCombined: existingHeader['登録番号_結合'],
+        chassis: existingHeader['車台番号'],
         policy: existingHeader['更新方針'],
         requestId: existingHeader['依頼ID'],
         answeredAt: existingHeader['回答日'],
@@ -272,12 +275,25 @@ function syncVehicles() {
           const row = existingData[i];
           const vehicleId = getCellValue(row, idxExisting.vehicleId);
           if (!vehicleId) continue;
-          existingByVehicleId[vehicleId] = {
+          const record = {
             policy: getCellValue(row, idxExisting.policy),
             requestId: getCellValue(row, idxExisting.requestId),
             answeredAt: getCellRaw(row, idxExisting.answeredAt),
             note: getCellValue(row, idxExisting.note),
           };
+          existingByVehicleId[vehicleId] = record;
+
+          const sourceSheet = getCellValue(row, idxExisting.sourceSheet);
+          const regCombined = getCellValue(row, idxExisting.regCombined);
+          const chassis = getCellValue(row, idxExisting.chassis);
+          if (sourceSheet && chassis) {
+            const key = `${sourceSheet}__${chassis}`;
+            if (!existingByVehicleId[key]) existingByVehicleId[key] = record;
+          }
+          if (sourceSheet && regCombined && /\d/.test(regCombined)) {
+            const key = `${sourceSheet}__${regCombined}`;
+            if (!existingByVehicleId[key]) existingByVehicleId[key] = record;
+          }
         }
       }
     }
