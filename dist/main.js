@@ -660,7 +660,39 @@ function sendReminderEmails() {
                 continue;
             const targetStart = parseDateValue(getCellRaw(row, reqHeader['対象開始日']));
             const targetEnd = parseDateValue(getCellRaw(row, reqHeader['対象終了日']));
-            const formUrls = extractFormUrlsFromRequestRow(row, reqHeader);
+            let formUrls = extractFormUrlsFromRequestRow(row, reqHeader);
+            const formIds = extractFormIdsFromRequestRow(row, reqHeader);
+            if (formIds.length > 0) {
+                normalizeExistingFormsForRequest({
+                    formIds,
+                    vehicles,
+                    vehicleHeader,
+                    tz,
+                    targetStart,
+                    targetEnd,
+                    deadline,
+                    dept,
+                    requestId,
+                });
+            }
+            if (formUrls.length === 0) {
+                const formResult = createRequestForms({
+                    requestId,
+                    dept,
+                    vehicles,
+                    vehicleHeader,
+                    tz,
+                    targetStart,
+                    targetEnd,
+                    deadline,
+                });
+                if (!formResult.ok) {
+                    appendNotificationLog('リマインド', dept, deptInfo.to, requestId, `フォーム作成失敗: ${formResult.message}`);
+                    continue;
+                }
+                applyFormResultToRequestRow(row, reqHeader, formResult, now);
+                formUrls = formResult.formUrls;
+            }
             if (formUrls.length === 0) {
                 appendNotificationLog('リマインド', dept, deptInfo.to, requestId, 'フォームURLが未設定');
                 continue;
