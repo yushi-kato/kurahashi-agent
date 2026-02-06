@@ -1892,6 +1892,14 @@ function protectSenmuColumns(sheet, settings) {
     catch (err) {
         Logger.log(`protectSenmuColumns getEffectiveUser failed: ${err}`);
     }
+    try {
+        const ownerEmail = sheet.getParent().getOwner().getEmail();
+        if (ownerEmail)
+            editorSet[ownerEmail] = true;
+    }
+    catch (err) {
+        Logger.log(`protectSenmuColumns getOwner failed: ${err}`);
+    }
     const editors = Object.keys(editorSet);
     if (editors.length === 0)
         return;
