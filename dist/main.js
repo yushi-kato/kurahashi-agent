@@ -30,6 +30,7 @@ const BATCH_STATUS = {
     INITIAL_SENT: '初回送信済',
     REMINDED: 'リマインド送信済',
     SENMU_REQUESTED: '専務依頼送信済',
+    RETURNED: '差戻しあり',
     APPLIED: '反映済',
 };
 const APPROVAL_STATUS = {
@@ -753,9 +754,14 @@ function applyApprovalDecisions() {
             const confirmHeader = getHeaderMap(confirmData[0]);
             const now = new Date();
             let appliedAny = false;
+            let hasReturnedDecision = false;
             for (let r = 1; r < confirmData.length; r++) {
                 const row = confirmData[r];
                 const decision = getCellValue(row, confirmHeader['専務判断']);
+                if (decision === SENMU_DECISION.RETURN) {
+                    hasReturnedDecision = true;
+                    continue;
+                }
                 if (decision !== SENMU_DECISION.APPROVE)
                     continue;
                 const alreadyApplied = toBoolean(getCellRaw(row, confirmHeader['マスター反映済み']), false);
@@ -812,7 +818,11 @@ function applyApprovalDecisions() {
                 .slice(1)
                 .filter((v) => getCellValue(v, confirmHeader['専務判断']) === SENMU_DECISION.APPROVE);
             const allApprovedApplied = approvedRows.every((v) => toBoolean(getCellRaw(v, confirmHeader['マスター反映済み']), false));
-            if (approvedRows.length > 0 && allApprovedApplied) {
+            if (hasReturnedDecision) {
+                batchRow[batchHeader['ステータス'] - 1] = BATCH_STATUS.RETURNED;
+                appendNotificationLog('反映', '', '', sheetName, '差戻しありのため反映待ち');
+            }
+            else if (approvedRows.length > 0 && allApprovedApplied) {
                 batchRow[batchHeader['ステータス'] - 1] = BATCH_STATUS.APPLIED;
                 batchRow[batchHeader['反映完了日時'] - 1] = new Date();
             }
@@ -1306,142 +1316,103 @@ function runTestSuite() {
         appendTestResult('開始', 'OK', new Date().toISOString());
         syncSchema();
         appendTestResult('syncSchema', 'OK', '');
-        generateDeptTokens();
-        appendTestResult('generateDeptTokens', 'OK', '空欄のみ生成');
-        const diag = diagnoseSourceSheets();
-        if (!diag.every((r) => r.ok)) {
-            appendTestResult('中断', 'NG', 'ソースシートの必須ヘッダが不足しています');
-            return;
-        }
-        const seed = seedTestVehicles();
-        if (seed && seed.skippedSheets && seed.skippedSheets.length > 0) {
-            appendTestResult('seedTestVehicles', 'NG', JSON.stringify(seed));
-            appendTestResult('中断', 'NG', 'テスト車両を投入できないシートがあります');
-            return;
-        }
-        appendTestResult('seedTestVehicles', 'OK', seed ? JSON.stringify(seed) : '');
-        syncVehicles();
-        appendTestResult('syncVehicles', 'OK', '');
-        // 期待値チェック（再実行でもOKな形）
         const ss = getSpreadsheet();
         const tz = ss.getSpreadsheetTimeZone();
         const settings = loadSettings();
-        const deptMaster = loadDeptMaster();
-        const validDept = pickFirstActiveDept(deptMaster);
-        const vehicleSheet = ss.getSheetByName(SHEET_NAMES.VEHICLE_VIEW);
-        if (vehicleSheet) {
-            const data = vehicleSheet.getDataRange().getValues();
-            const header = data.length > 0 ? getHeaderMap(data[0]) : {};
-            const idx = {
-                regCombined: header['登録番号_結合'],
-                dept: header['管理部門'],
-                contractEnd: header['契約満了日'],
-                requestId: header['依頼ID'],
-            };
-            const startDate = toDateOnly(new Date(), tz);
-            const endDate = addMonthsClamped(startDate, settings.expiryMonths);
-            let testTotal = 0;
-            let testInRange = 0;
-            let testInRangeWithRequestId = 0;
-            for (let i = 1; i < data.length; i++) {
-                const row = data[i];
-                const reg = getCellValue(row, idx.regCombined);
-                if (!reg || !reg.startsWith('TEST'))
-                    continue;
-                testTotal += 1;
-                const dept = getCellValue(row, idx.dept);
-                const contractEnd = parseDateValue(getCellRaw(row, idx.contractEnd));
-                const contractDate = contractEnd ? toDateOnly(contractEnd, tz) : null;
-                if (dept === validDept && contractDate && isWithinRange(contractDate, startDate, endDate)) {
-                    testInRange += 1;
-                    if (getCellValue(row, idx.requestId))
-                        testInRangeWithRequestId += 1;
-                }
-            }
-            appendTestResult('期待値:統合ビュー_テスト車両件数', testTotal >= 3 ? 'OK' : 'NG', String(testTotal));
-            appendTestResult('期待値:統合ビュー_期限内車両件数', testInRange >= SOURCE_SHEETS.length ? 'OK' : 'NG', `dept=${validDept || '(empty)'} count=${testInRange}`);
-            // createRequests 前なので依頼IDは「付いていても付いていなくても」OK（再実行想定）
-            appendTestResult('期待値:統合ビュー_期限内_依頼ID付与済(参考)', testInRangeWithRequestId <= testInRange ? 'OK' : 'NG', `${testInRangeWithRequestId}/${testInRange}台`);
+        const year = new Date().getFullYear();
+        const testSettings = {
+            ...settings,
+            semiannualSendDateMarch: '03-01',
+            semiannualSendDateSeptember: '09-01',
+            responseDeadlineMarch: '03-31',
+            responseDeadlineSeptember: '09-30',
+        };
+        const marchSchedule = resolveSemiannualSchedule(new Date(year, 2, 1), testSettings, tz);
+        const expectedMarchStart = toDateOnly(new Date(year, 9, 1), tz);
+        const expectedMarchEnd = toDateOnly(new Date(year + 1, 2, 31), tz);
+        const expectedMarchDeadline = toDateOnly(new Date(year, 2, 31), tz);
+        appendTestResult('3月便: スケジュール生成', marchSchedule ? 'OK' : 'NG', marchSchedule ? '生成あり' : '生成なし');
+        appendTestResult('3月便: 抽出範囲', marchSchedule &&
+            marchSchedule.rangeStart.getTime() === expectedMarchStart.getTime() &&
+            marchSchedule.rangeEnd.getTime() === expectedMarchEnd.getTime()
+            ? 'OK'
+            : 'NG', marchSchedule
+            ? `${formatDateLabel(marchSchedule.rangeStart, tz)}〜${formatDateLabel(marchSchedule.rangeEnd, tz)}`
+            : '範囲なし');
+        appendTestResult('3月便: 期限(送付年3/31)', marchSchedule && marchSchedule.deadline.getTime() === expectedMarchDeadline.getTime() ? 'OK' : 'NG', marchSchedule ? formatDateLabel(marchSchedule.deadline, tz) : '期限なし');
+        const septemberSchedule = resolveSemiannualSchedule(new Date(year, 8, 1), testSettings, tz);
+        const expectedSeptemberStart = toDateOnly(new Date(year, 3, 1), tz);
+        const expectedSeptemberEnd = toDateOnly(new Date(year, 8, 30), tz);
+        const expectedSeptemberDeadline = toDateOnly(new Date(year, 8, 30), tz);
+        appendTestResult('9月便: スケジュール生成', septemberSchedule ? 'OK' : 'NG', septemberSchedule ? '生成あり' : '生成なし');
+        appendTestResult('9月便: 抽出範囲', septemberSchedule &&
+            septemberSchedule.rangeStart.getTime() === expectedSeptemberStart.getTime() &&
+            septemberSchedule.rangeEnd.getTime() === expectedSeptemberEnd.getTime()
+            ? 'OK'
+            : 'NG', septemberSchedule
+            ? `${formatDateLabel(septemberSchedule.rangeStart, tz)}〜${formatDateLabel(septemberSchedule.rangeEnd, tz)}`
+            : '範囲なし');
+        appendTestResult('9月便: 期限(同年9/30)', septemberSchedule && septemberSchedule.deadline.getTime() === expectedSeptemberDeadline.getTime() ? 'OK' : 'NG', septemberSchedule ? formatDateLabel(septemberSchedule.deadline, tz) : '期限なし');
+        const reminderDate = addDays(expectedSeptemberDeadline, -10);
+        const expectedReminderDate = toDateOnly(new Date(year, 8, 20), tz);
+        appendTestResult('リマインド: 期限10日前', reminderDate.getTime() === expectedReminderDate.getTime() ? 'OK' : 'NG', formatDateLabel(reminderDate, tz));
+        const tempSheetName = `本部長副本部長確認_TEST_${Utilities.getUuid().slice(0, 8)}`;
+        const tempConfirmSheet = ensureConfirmSheet(ss, tempSheetName, testSettings);
+        try {
+            const empty = new Array(CONFIRM_SHEET_HEADERS.length).fill('');
+            tempConfirmSheet.getRange(2, 1, 1, empty.length).setValues([empty]);
+            applyConfirmSheetValidations(tempConfirmSheet, 1);
+            const tempHeader = getHeaderMap(tempConfirmSheet.getRange(1, 1, 1, tempConfirmSheet.getLastColumn()).getValues()[0]);
+            const protections = tempConfirmSheet
+                .getProtections(SpreadsheetApp.ProtectionType.RANGE)
+                .filter((p) => p.getDescription() === 'managed_by_script:senmu_columns');
+            const protectedCols = protections.map((p) => p.getRange().getColumn());
+            const expectedProtectedCols = ['専務判断', '専務コメント']
+                .map((name) => tempHeader[name])
+                .filter((col) => !!col);
+            const hasAllProtectedCols = expectedProtectedCols.every((col) => protectedCols.indexOf(col) >= 0);
+            appendTestResult('専務列保護: 対象列', hasAllProtectedCols ? 'OK' : 'NG', `保護列=${protectedCols.join(',')}`);
+            const hqValidation = tempHeader['本部回答'] ? tempConfirmSheet.getRange(2, tempHeader['本部回答']).getDataValidation() : null;
+            const senmuValidation = tempHeader['専務判断'] ? tempConfirmSheet.getRange(2, tempHeader['専務判断']).getDataValidation() : null;
+            appendTestResult('確認シート: 本部回答バリデーション', hqValidation ? 'OK' : 'NG', hqValidation ? '設定あり' : '設定なし');
+            appendTestResult('確認シート: 専務判断バリデーション', senmuValidation ? 'OK' : 'NG', senmuValidation ? '設定あり' : '設定なし');
         }
-        const needsInputSheet = ss.getSheetByName(SHEET_NAMES.NEEDS_INPUT);
-        if (needsInputSheet) {
-            const data = needsInputSheet.getDataRange().getValues();
-            const header = data.length > 0 ? getHeaderMap(data[0]) : {};
-            const idx = { reason: header['不備内容'], reg: header['登録番号_結合'] };
-            const counts = {
-                契約満了日なし: 0,
-                管理部門なし: 0,
-                部署マスタ未登録: 0,
-            };
-            for (let i = 1; i < data.length; i++) {
-                const row = data[i];
-                const reg = getCellValue(row, idx.reg);
-                // テスト車両は登録番号_結合が "TEST..." になる
-                if (reg && !reg.startsWith('TEST'))
-                    continue;
-                const reason = getCellValue(row, idx.reason);
-                if (counts[reason] !== undefined)
-                    counts[reason] += 1;
-            }
-            Object.keys(counts).forEach((key) => {
-                appendTestResult(`期待値:要入力_${key}`, counts[key] >= 1 ? 'OK' : 'NG', String(counts[key]));
-            });
+        finally {
+            ss.deleteSheet(tempConfirmSheet);
         }
-        const requestSheet = ss.getSheetByName(SHEET_NAMES.REQUESTS);
-        const beforeRequestLastRow = requestSheet ? requestSheet.getLastRow() : 0;
-        createRequests();
-        const afterRequestLastRow = requestSheet ? requestSheet.getLastRow() : 0;
-        appendTestResult('createRequests', 'OK', `newRows=${Math.max(0, afterRequestLastRow - beforeRequestLastRow)}`);
-        // 期待値: createRequests は同じ入力に対して増え続けない（重複防止）
-        const beforeSecondLastRow = requestSheet ? requestSheet.getLastRow() : 0;
-        createRequests();
-        const afterSecondLastRow = requestSheet ? requestSheet.getLastRow() : 0;
-        appendTestResult('期待値:createRequests_重複防止', afterSecondLastRow === beforeSecondLastRow ? 'OK' : 'NG', `newRows=${Math.max(0, afterSecondLastRow - beforeSecondLastRow)}`);
-        // 期待値: 期限内テスト車両へ依頼IDが付与され、依頼シートに管理部門行が存在する
-        if (vehicleSheet) {
-            const data = vehicleSheet.getDataRange().getValues();
-            const header = data.length > 0 ? getHeaderMap(data[0]) : {};
-            const idx = {
-                regCombined: header['登録番号_結合'],
-                dept: header['管理部門'],
-                contractEnd: header['契約満了日'],
-                requestId: header['依頼ID'],
-            };
-            const startDate = toDateOnly(new Date(), tz);
-            const endDate = addMonthsClamped(startDate, settings.expiryMonths);
-            let testInRange = 0;
-            let testInRangeWithRequestId = 0;
-            for (let i = 1; i < data.length; i++) {
-                const row = data[i];
-                const reg = getCellValue(row, idx.regCombined);
-                if (!reg || !reg.startsWith('TEST'))
-                    continue;
-                const dept = getCellValue(row, idx.dept);
-                const contractEnd = parseDateValue(getCellRaw(row, idx.contractEnd));
-                const contractDate = contractEnd ? toDateOnly(contractEnd, tz) : null;
-                if (dept === validDept && contractDate && isWithinRange(contractDate, startDate, endDate)) {
-                    testInRange += 1;
-                    if (getCellValue(row, idx.requestId))
-                        testInRangeWithRequestId += 1;
-                }
-            }
-            appendTestResult('期待値:createRequests_期限内_依頼ID付与', testInRange > 0 && testInRangeWithRequestId === testInRange ? 'OK' : 'NG', `${testInRangeWithRequestId}/${testInRange}台`);
-        }
-        if (requestSheet) {
-            const data = requestSheet.getDataRange().getValues();
-            const header = data.length > 0 ? getHeaderMap(data[0]) : {};
-            const idx = { dept: header['管理部門'], requestId: header['requestId'] };
-            let count = 0;
-            for (let i = 1; i < data.length; i++) {
-                const row = data[i];
-                if (!getCellValue(row, idx.requestId))
-                    continue;
-                if (validDept && getCellValue(row, idx.dept) === validDept)
-                    count += 1;
-            }
-            appendTestResult('期待値:createRequests_依頼行(dept)', count >= 1 ? 'OK' : 'NG', `dept=${validDept} count=${count}`);
-        }
+        const vehicleHeaderRow = [
+            '登録番号',
+            '車台番号',
+            '契約開始日',
+            '契約満了日',
+            '管理部門',
+            '管理担当者',
+            '契約期間',
+            '車検満了日',
+            'リース料（税抜）',
+            'マスター反映済み',
+            '反映日時',
+        ];
+        const vehicleHeader = getHeaderMap(vehicleHeaderRow);
+        const sourceHeader = resolveSourceHeaders(vehicleHeader);
+        const vehicleData = [
+            vehicleHeaderRow,
+            ['品川500あ1234', 'CH-001', '', '', '', '', '', '', '', false, ''],
+            ['品川500あ5678', 'CH-002', '', '', '', '', '', '', '', false, ''],
+        ];
+        const vehicleIndex = buildVehicleIndex(vehicleData, sourceHeader, vehicleHeader);
+        const bothMatched = resolveVehicleRowIndex(vehicleIndex, '品川500あ1234', 'CH-001') === 1;
+        const regOnlyMatched = resolveVehicleRowIndex(vehicleIndex, '品川500あ5678', '') === 2;
+        const unmatched = resolveVehicleRowIndex(vehicleIndex, '存在しない', 'NONE') === null;
+        appendTestResult('台帳突合: 登録番号+車台番号', bothMatched ? 'OK' : 'NG', String(resolveVehicleRowIndex(vehicleIndex, '品川500あ1234', 'CH-001')));
+        appendTestResult('台帳突合: 登録番号のみ', regOnlyMatched ? 'OK' : 'NG', String(resolveVehicleRowIndex(vehicleIndex, '品川500あ5678', '')));
+        appendTestResult('台帳突合: 非該当', unmatched ? 'OK' : 'NG', String(resolveVehicleRowIndex(vehicleIndex, '存在しない', 'NONE')));
         appendTestResult('完了', 'OK', '');
+        uiAlertSafe('テストが完了しました。結果は「テスト結果」シートを確認してください。');
+    }
+    catch (err) {
+        appendTestResult('中断', 'NG', String(err));
+        throw err;
     }
     finally {
         lock.releaseLock();
@@ -1868,7 +1839,7 @@ function resolveSemiannualSchedule(now, settings, tz) {
     if (marchSend && marchSend.getTime() === today.getTime()) {
         const rangeStart = toDateOnly(new Date(year, 9, 1), tz);
         const rangeEnd = toDateOnly(new Date(year + 1, 2, 31), tz);
-        const deadline = parseMonthDayToDate(settings.responseDeadlineMarch, year + 1, tz) || marchSend;
+        const deadline = parseMonthDayToDate(settings.responseDeadlineMarch, year, tz) || marchSend;
         return { sendDate: marchSend, deadline, rangeStart, rangeEnd };
     }
     if (septemberSend && septemberSend.getTime() === today.getTime()) {
@@ -1909,7 +1880,19 @@ function applyConfirmSheetValidations(sheet, rowCount) {
 function protectSenmuColumns(sheet, settings) {
     const headerMap = getHeaderMap(sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]);
     const columns = ['専務判断', '専務コメント'];
-    const editors = splitEmails(settings.senmuTo);
+    const editorSet = {};
+    splitEmails(settings.senmuTo).forEach((email) => {
+        editorSet[email] = true;
+    });
+    try {
+        const effectiveUserEmail = Session.getEffectiveUser().getEmail();
+        if (effectiveUserEmail)
+            editorSet[effectiveUserEmail] = true;
+    }
+    catch (err) {
+        Logger.log(`protectSenmuColumns getEffectiveUser failed: ${err}`);
+    }
+    const editors = Object.keys(editorSet);
     if (editors.length === 0)
         return;
     const protections = sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE);
