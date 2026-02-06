@@ -1971,7 +1971,7 @@ function resolveSemiannualSchedule(now: Date, settings: ReturnType<typeof loadSe
   if (marchSend && marchSend.getTime() === today.getTime()) {
     const rangeStart = toDateOnly(new Date(year, 9, 1), tz);
     const rangeEnd = toDateOnly(new Date(year + 1, 2, 31), tz);
-    const deadline = parseMonthDayToDate(settings.responseDeadlineMarch, year, tz) || marchSend;
+    const deadline = parseMonthDayToDate(settings.responseDeadlineMarch, year + 1, tz) || marchSend;
     return { sendDate: marchSend, deadline, rangeStart, rangeEnd };
   }
   if (septemberSend && septemberSend.getTime() === today.getTime()) {
