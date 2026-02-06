@@ -32,12 +32,25 @@ const APPROVAL_INPUT = {
     APPROVE: '承認',
     RETURN: '差戻し',
 };
-const ANSWER_OPTIONS = ['再リース', '新車入替', '廃止', '未定'];
+const APPROVAL_FORM_TITLES = {
+    DECISION: '承認判断',
+    COMMENT: '差戻しコメント（差戻し時のみ）',
+};
+const APPROVAL_FORM_REQUEST_ID_PROP_PREFIX = 'APPROVAL_FORM_REQUEST_ID__';
+const ANSWER_LABELS = {
+    RENEW: '更新',
+    CANCELLATION_REPLACE: '解約（入替）',
+    CANCELLATION_END: '解約（満了）',
+};
+const ANSWER_OPTIONS = [ANSWER_LABELS.RENEW, ANSWER_LABELS.CANCELLATION_REPLACE, ANSWER_LABELS.CANCELLATION_END];
+const LEGACY_ANSWER_LABEL_MAP = {
+    再リース: ANSWER_LABELS.RENEW,
+    新車入替: ANSWER_LABELS.CANCELLATION_REPLACE,
+    廃止: ANSWER_LABELS.CANCELLATION_END,
+};
 const MAX_VEHICLES_PER_FORM = 50;
 const FORM_ITEM_TITLES = {
-    RESPONDER: '回答者（任意）',
     POLICY_GRID: '更新方針（車両ごと）',
-    COMMENT: 'コメント（任意）',
 };
 const FORM_VEHICLE_IDS_PROP_PREFIX = 'FORM_VEHICLE_IDS__';
 const VIEW_SHEET_PROTECTION_DESC_PREFIX = 'managed_by_script:view_sheet:';
@@ -68,6 +81,10 @@ const SCHEMA_DEFS = [
             '契約開始日',
             '契約満了日',
             '管理部門',
+            '管理担当者',
+            '契約期間',
+            '車検満了日',
+            'リース料（税抜）',
             '更新方針',
             '依頼ID',
             '回答日',
@@ -111,6 +128,11 @@ const SCHEMA_DEFS = [
             '承認日時',
             '差戻しコメント',
             '車両管理通知送信日時',
+            '承認フォームID',
+            '承認フォームURL',
+            '承認フォーム編集URL',
+            '承認フォームトリガーID',
+            '承認フォーム作成日時',
         ],
     },
     {
@@ -131,10 +153,9 @@ const SCHEMA_DEFS = [
             '管理部門',
             '対象期間',
             '総件数',
-            '再リース',
-            '新車入替',
-            '廃止',
-            '未定',
+            ANSWER_LABELS.RENEW,
+            ANSWER_LABELS.CANCELLATION_REPLACE,
+            ANSWER_LABELS.CANCELLATION_END,
             '未回答',
             '最終更新日時',
         ],
@@ -239,6 +260,17 @@ function uiAlertSafe(message) {
     }
     catch (e) {
         Logger.log(`UI alert skipped: ${message}`);
+    }
+}
+function uiShowModalSafe(title, body) {
+    try {
+        const html = HtmlService.createHtmlOutput(`<div style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; white-space: pre-wrap; line-height: 1.4;">${escapeHtml(body)}</div>`)
+            .setWidth(900)
+            .setHeight(700);
+        SpreadsheetApp.getUi().showModalDialog(html, title);
+    }
+    catch (e) {
+        Logger.log(`UI modal skipped: ${title}\n${body}`);
     }
 }
 function syncSchema() {
@@ -381,6 +413,10 @@ function syncVehicles() {
                 const contractStart = parseDateValue(getCellRaw(row, headerIndexes.contractStart));
                 const contractEnd = parseDateValue(getCellRaw(row, headerIndexes.contractEnd));
                 const dept = getCellValue(row, headerIndexes.dept);
+                const manager = getCellValue(row, headerIndexes.manager);
+                const contractTerm = getCellValue(row, headerIndexes.contractTerm);
+                const inspectionEnd = parseDateValue(getCellRaw(row, headerIndexes.inspectionEnd));
+                const leaseFee = getCellValue(row, headerIndexes.leaseFee);
                 const vehicleId = buildVehicleId(sheetName, regCombined, chassis, i + 1);
                 const existing = existingByVehicleId[vehicleId] || {
                     policy: '',
@@ -439,6 +475,10 @@ function syncVehicles() {
                     contractStart,
                     contractEnd,
                     dept,
+                    manager,
+                    contractTerm,
+                    inspectionEnd,
+                    leaseFee,
                     existing.policy,
                     existing.requestId,
                     existing.answeredAt,
@@ -539,6 +579,11 @@ function createRequests() {
             setCell('承認日時', '');
             setCell('差戻しコメント', '');
             setCell('車両管理通知送信日時', '');
+            setCell('承認フォームID', '');
+            setCell('承認フォームURL', '');
+            setCell('承認フォーム編集URL', '');
+            setCell('承認フォームトリガーID', '');
+            setCell('承認フォーム作成日時', '');
             newRequestRows.push(row);
             // 車両統合ビューへ依頼IDを反映
             requestsByDept[dept].forEach((item) => {
@@ -971,15 +1016,13 @@ function onRequestFormSubmit(e) {
             Logger.log(`onRequestFormSubmit: 回答が空です (${requestInfo.requestId})`);
             return;
         }
-        const commentMap = parseVehicleComments(parsed.commentText, vehicleIds);
-        const useVehicleComments = Object.keys(commentMap).length > 0;
         const now = new Date();
         const answerInputs = vehicleIds.map((vehicleId) => ({
             requestId: requestInfo.requestId,
             vehicleId,
-            answer: parsed.answersByVehicleId[vehicleId],
-            comment: useVehicleComments ? commentMap[vehicleId] || '' : parsed.commentText || '',
-            responder: parsed.responder || '',
+            answer: normalizeAnswerLabel(parsed.answersByVehicleId[vehicleId]),
+            comment: '',
+            responder: '',
             answeredAt: now,
         }));
         upsertAnswers(answerInputs);
@@ -992,6 +1035,84 @@ function onRequestFormSubmit(e) {
     }
     finally {
         lock.releaseLock();
+    }
+}
+function onApprovalFormSubmit(e) {
+    const lock = LockService.getDocumentLock();
+    lock.waitLock(30000);
+    try {
+        if (!e || !e.response) {
+            Logger.log('onApprovalFormSubmit: response がありません');
+            return;
+        }
+        const formId = getFormIdFromEvent(e);
+        if (!formId) {
+            Logger.log('onApprovalFormSubmit: formId を取得できません');
+            return;
+        }
+        const requestInfo = findRequestByApprovalFormId(formId);
+        if (!requestInfo || !requestInfo.requestId) {
+            Logger.log(`onApprovalFormSubmit: formId に紐づく依頼が見つかりません (${formId})`);
+            return;
+        }
+        const parsed = extractApprovalDecisionFromFormResponse(e.response);
+        if (!parsed.decision) {
+            Logger.log(`onApprovalFormSubmit: 承認判断が空です (${requestInfo.requestId})`);
+            return;
+        }
+        buildApprovalQueueSheetInternal();
+        writeApprovalDecisionToQueue({
+            requestId: requestInfo.requestId,
+            decision: parsed.decision,
+            comment: parsed.comment,
+        });
+    }
+    finally {
+        lock.releaseLock();
+    }
+    // 実際の状態更新・通知送信は既存ロジックで一元処理する
+    applyApprovalDecisions();
+}
+function extractApprovalDecisionFromFormResponse(response) {
+    const result = {
+        decision: '',
+        comment: '',
+    };
+    response.getItemResponses().forEach((itemResponse) => {
+        const item = itemResponse.getItem();
+        const title = item.getTitle();
+        if (title === APPROVAL_FORM_TITLES.DECISION) {
+            result.decision = String(itemResponse.getResponse() || '').trim();
+            return;
+        }
+        if (title === APPROVAL_FORM_TITLES.COMMENT) {
+            result.comment = String(itemResponse.getResponse() || '').trim();
+        }
+    });
+    return result;
+}
+function writeApprovalDecisionToQueue(input) {
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.APPROVAL_QUEUE);
+    if (!sheet)
+        return;
+    ensureHeaders(sheet, 1, getSchemaHeaders(SHEET_NAMES.APPROVAL_QUEUE));
+    const data = sheet.getDataRange().getValues();
+    if (data.length <= 1)
+        return;
+    const headerMap = getHeaderMap(data[0]);
+    const requestIdIndex = headerMap['requestId'];
+    const decisionIndex = headerMap['承認入力'];
+    const commentIndex = headerMap['差戻しコメント'];
+    if (!requestIdIndex || !decisionIndex || !commentIndex)
+        return;
+    for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        if (getCellValue(row, requestIdIndex) !== input.requestId)
+            continue;
+        row[decisionIndex - 1] = input.decision;
+        row[commentIndex - 1] = input.comment || '';
+        sheet.getRange(1, 1, data.length, data[0].length).setValues(data);
+        return;
     }
 }
 function applyAnswers() {
@@ -1018,7 +1139,7 @@ function applyAnswers() {
                 answerMap[vehicleId] = {
                     vehicleId,
                     requestId: getCellValue(row, answerHeader['requestId']),
-                    answer: getCellValue(row, answerHeader['回答']),
+                    answer: normalizeAnswerLabel(getCellValue(row, answerHeader['回答'])),
                     comment: getCellValue(row, answerHeader['コメント']),
                     answeredAt: answeredAt || new Date(),
                 };
@@ -1115,14 +1236,13 @@ function buildSummarySheet() {
                 .slice(1)
                 .filter((v) => getCellValue(v, vehicleHeader['依頼ID']) === requestId);
             const counts = {
-                再リース: 0,
-                新車入替: 0,
-                廃止: 0,
-                未定: 0,
+                [ANSWER_LABELS.RENEW]: 0,
+                [ANSWER_LABELS.CANCELLATION_REPLACE]: 0,
+                [ANSWER_LABELS.CANCELLATION_END]: 0,
                 未回答: 0,
             };
             vehicles.forEach((v) => {
-                const policy = getCellValue(v, vehicleHeader['更新方針']);
+                const policy = normalizeAnswerLabel(getCellValue(v, vehicleHeader['更新方針']));
                 if (policy && counts[policy] !== undefined) {
                     counts[policy] += 1;
                 }
@@ -1135,10 +1255,9 @@ function buildSummarySheet() {
                 dept,
                 `${formatDateLabel(start || now, ss.getSpreadsheetTimeZone())}〜${formatDateLabel(end || now, ss.getSpreadsheetTimeZone())}`,
                 vehicles.length,
-                counts['再リース'],
-                counts['新車入替'],
-                counts['廃止'],
-                counts['未定'],
+                counts[ANSWER_LABELS.RENEW],
+                counts[ANSWER_LABELS.CANCELLATION_REPLACE],
+                counts[ANSWER_LABELS.CANCELLATION_END],
                 counts['未回答'],
                 now,
             ]);
@@ -1173,12 +1292,11 @@ function sendSummaryEmail() {
             const dept = getCellValue(row, headerMap['管理部門']);
             const range = getCellValue(row, headerMap['対象期間']);
             const total = getCellValue(row, headerMap['総件数']);
-            const lease = getCellValue(row, headerMap['再リース']);
-            const replace = getCellValue(row, headerMap['新車入替']);
-            const end = getCellValue(row, headerMap['廃止']);
-            const pending = getCellValue(row, headerMap['未定']);
+            const renew = getCellValue(row, headerMap[ANSWER_LABELS.RENEW]);
+            const replace = getCellValue(row, headerMap[ANSWER_LABELS.CANCELLATION_REPLACE]);
+            const end = getCellValue(row, headerMap[ANSWER_LABELS.CANCELLATION_END]);
             const unanswered = getCellValue(row, headerMap['未回答']);
-            lines.push(`${dept} (${range}) - 合計:${total} 再:${lease} 入替:${replace} 廃止:${end} 未定:${pending} 未回答:${unanswered}`);
+            lines.push(`${dept} (${range}) - 合計:${total} 更新:${renew} 解約(入替):${replace} 解約(満了):${end} 未回答:${unanswered}`);
         }
         const body = lines.join('\n');
         MailApp.sendEmail({
@@ -1266,11 +1384,16 @@ function buildApprovalQueueSheetInternal() {
             approvalStatus === APPROVAL_STATUS.APPROVED;
         if (!shouldShow)
             continue;
+        let promotedToPending = false;
         if (status === REQUEST_STATUS.COMPLETED &&
             approvalStatusIndex &&
             (!approvalStatus || approvalStatus === APPROVAL_STATUS.NOT_SENT || approvalStatus === APPROVAL_STATUS.RETURNED)) {
             row[approvalStatusIndex - 1] = APPROVAL_STATUS.PENDING;
+            if (requestHeader['承認依頼送信日時']) {
+                row[requestHeader['承認依頼送信日時'] - 1] = '';
+            }
             requestSheetChanged = true;
+            promotedToPending = true;
         }
         const targetStart = parseDateValue(getCellRaw(row, requestHeader['対象開始日']));
         const targetEnd = parseDateValue(getCellRaw(row, requestHeader['対象終了日']));
@@ -1284,14 +1407,13 @@ function buildApprovalQueueSheetInternal() {
         const counts = {
             answered: 0,
             total: vehicles.length,
-            再リース: 0,
-            新車入替: 0,
-            廃止: 0,
-            未定: 0,
+            [ANSWER_LABELS.RENEW]: 0,
+            [ANSWER_LABELS.CANCELLATION_REPLACE]: 0,
+            [ANSWER_LABELS.CANCELLATION_END]: 0,
             未回答: 0,
         };
         vehicles.forEach((v) => {
-            const policy = getCellValue(v, vehicleHeader['更新方針']);
+            const policy = normalizeAnswerLabel(getCellValue(v, vehicleHeader['更新方針']));
             if (policy)
                 counts.answered += 1;
             if (policy && counts[policy] !== undefined) {
@@ -1303,18 +1425,17 @@ function buildApprovalQueueSheetInternal() {
         });
         const summaryText = [
             `合計:${counts.total}`,
-            `再:${counts['再リース']}`,
-            `入替:${counts['新車入替']}`,
-            `満了:${counts['廃止']}`,
-            `未定:${counts['未定']}`,
+            `更新:${counts[ANSWER_LABELS.RENEW]}`,
+            `解約(入替):${counts[ANSWER_LABELS.CANCELLATION_REPLACE]}`,
+            `解約(満了):${counts[ANSWER_LABELS.CANCELLATION_END]}`,
             `未回答:${counts['未回答']}`,
         ].join(' ');
         const listLines = vehicles
             .map((v, index) => formatVehicleLineForApproval(v, vehicleHeader, tz, index))
             .join('\n');
         const existing = existingInputByRequestId[requestId];
-        const approvalInput = existing ? existing.input : '';
-        const commentInput = existing ? existing.comment : returnedComment || '';
+        const approvalInput = promotedToPending ? '' : existing ? existing.input : '';
+        const commentInput = promotedToPending ? '' : existing ? existing.comment : returnedComment || '';
         rows.push([
             requestId,
             dept,
@@ -1369,8 +1490,16 @@ function sendApprovalRequestEmails() {
         if (approvalData.length <= 1)
             return;
         const approvalHeader = getHeaderMap(approvalData[0]);
-        const pendingRequestIds = [];
+        const requestRowIndexById = {};
+        for (let i = 1; i < requestData.length; i++) {
+            const requestId = getCellValue(requestData[i], requestHeader['requestId']);
+            if (requestId)
+                requestRowIndexById[requestId] = i;
+        }
+        const preparedRequestIds = [];
         const lines = [];
+        const formUrlLines = [];
+        const now = new Date();
         for (let i = 1; i < approvalData.length; i++) {
             const row = approvalData[i];
             const requestId = getCellValue(row, approvalHeader['requestId']);
@@ -1382,26 +1511,54 @@ function sendApprovalRequestEmails() {
                 continue;
             if (requestedAt)
                 continue;
+            const requestRowIndex = requestRowIndexById[requestId];
+            if (requestRowIndex === undefined)
+                continue;
+            const requestRow = requestData[requestRowIndex];
             const dept = getCellValue(row, approvalHeader['管理部門']);
             const rangeStart = parseDateValue(getCellRaw(row, approvalHeader['対象開始日']));
             const rangeEnd = parseDateValue(getCellRaw(row, approvalHeader['対象終了日']));
             const summaryText = getCellValue(row, approvalHeader['一次結果サマリ']);
+            const existingApprovalFormId = getCellValue(requestRow, requestHeader['承認フォームID']);
+            const vehiclesText = getCellValue(row, approvalHeader['対象車両一覧']);
+            const formResult = createOrUpdateApprovalForm({
+                requestId,
+                dept,
+                targetStart: rangeStart,
+                targetEnd: rangeEnd,
+                summaryText,
+                vehiclesText,
+                existingFormId: existingApprovalFormId,
+                tz: ss.getSpreadsheetTimeZone(),
+            });
+            if (!formResult.ok) {
+                appendNotificationLog('承認依頼', dept, '', requestId, `承認フォーム作成失敗: ${formResult.message}`);
+                continue;
+            }
+            requestRow[requestHeader['承認フォームID'] - 1] = formResult.formId;
+            requestRow[requestHeader['承認フォームURL'] - 1] = formResult.formUrl;
+            requestRow[requestHeader['承認フォーム編集URL'] - 1] = formResult.formEditUrl;
+            requestRow[requestHeader['承認フォームトリガーID'] - 1] = formResult.formTriggerId;
+            if (!getCellRaw(requestRow, requestHeader['承認フォーム作成日時'])) {
+                requestRow[requestHeader['承認フォーム作成日時'] - 1] = now;
+            }
             lines.push(`${dept || ''} ${requestId}（${formatDateLabel(rangeStart || new Date(), ss.getSpreadsheetTimeZone())}〜${formatDateLabel(rangeEnd || new Date(), ss.getSpreadsheetTimeZone())}） ${summaryText}`);
-            pendingRequestIds.push(requestId);
+            formUrlLines.push(`- ${requestId}: ${formResult.formUrl}`);
+            preparedRequestIds.push(requestId);
         }
-        if (pendingRequestIds.length === 0)
+        if (preparedRequestIds.length === 0)
             return;
-        const approvalUrl = buildSheetUrlWithGid(ss, approvalSheet);
-        const subject = `【車両更新】専務承認依頼（${pendingRequestIds.length}件）`;
+        const subject = `【車両更新】専務承認依頼（${preparedRequestIds.length}件）`;
         const body = [
             '一次確認（フォーム回答）の結果が揃ったため、承認/差戻しの入力をお願いします。',
             '',
-            `承認待ち一覧: ${approvalUrl}`,
+            '承認フォームURL:',
+            ...formUrlLines,
             '',
             '対象依頼:',
             ...lines.map((l) => `- ${l}`),
             '',
-            `入力方法: 「${SHEET_NAMES.APPROVAL_QUEUE}」タブの「承認入力」列に「${APPROVAL_INPUT.APPROVE}」または「${APPROVAL_INPUT.RETURN}」を入力してください。差戻しの場合は「差戻しコメント」も入力してください。`,
+            `入力方法: 各フォームで「${APPROVAL_INPUT.APPROVE}」または「${APPROVAL_INPUT.RETURN}」を選択し、差戻し時はコメントを入力してください。`,
         ].join('\n');
         try {
             MailApp.sendEmail({
@@ -1411,13 +1568,12 @@ function sendApprovalRequestEmails() {
                 name: settings.fromName,
                 body,
             });
-            appendNotificationLog('承認依頼', '', settings.approverTo, pendingRequestIds.join(','), `成功(${pendingRequestIds.length}件)`);
+            appendNotificationLog('承認依頼', '', settings.approverTo, preparedRequestIds.join(','), `成功(${preparedRequestIds.length}件)`);
         }
         catch (err) {
-            appendNotificationLog('承認依頼', '', settings.approverTo, pendingRequestIds.join(','), `失敗: ${err}`);
+            appendNotificationLog('承認依頼', '', settings.approverTo, preparedRequestIds.join(','), `失敗: ${err}`);
             return;
         }
-        const now = new Date();
         const requestIdIndex = requestHeader['requestId'];
         const approvalRequestedAtIndex = requestHeader['承認依頼送信日時'];
         if (requestIdIndex && approvalRequestedAtIndex) {
@@ -1426,7 +1582,7 @@ function sendApprovalRequestEmails() {
                 const requestId = getCellValue(row, requestIdIndex);
                 if (!requestId)
                     continue;
-                if (pendingRequestIds.indexOf(requestId) === -1)
+                if (preparedRequestIds.indexOf(requestId) === -1)
                     continue;
                 row[approvalRequestedAtIndex - 1] = now;
             }
@@ -1445,7 +1601,7 @@ function applyApprovalDecisions() {
         const ss = getSpreadsheet();
         const settings = loadSettings();
         if (!settings.approvalFlowEnabled) {
-            uiAlertSafe('承認フロー_有効 が FALSE のため処理をスキップしました。');
+            uiShowModalSafe('承認結果反映（通知送信）', '承認フロー_有効 が FALSE のため処理をスキップしました。');
             return;
         }
         const approvalSheet = ss.getSheetByName(SHEET_NAMES.APPROVAL_QUEUE);
@@ -1476,6 +1632,17 @@ function applyApprovalDecisions() {
         }
         const now = new Date();
         const approverEmail = safeGetUserEmail();
+        const reportLines = [];
+        const detailLines = [];
+        let inputRows = 0;
+        let invalidInputRows = 0;
+        let skippedSameRows = 0;
+        let missingRequestRows = 0;
+        let approvedRows = 0;
+        let returnedRows = 0;
+        if (!settings.mailSendEnabled) {
+            reportLines.push('注意: 通知_メール送信=FALSE のため、メール送信はスキップします（状態更新のみ）。');
+        }
         let processed = 0;
         for (let i = 1; i < approvalData.length; i++) {
             const row = approvalData[i];
@@ -1485,18 +1652,26 @@ function applyApprovalDecisions() {
             const input = getCellValue(row, approvalHeader['承認入力']);
             if (!input)
                 continue;
+            inputRows += 1;
             if (input !== APPROVAL_INPUT.APPROVE && input !== APPROVAL_INPUT.RETURN)
                 continue;
             const requestRowIndex = requestRowIndexById[requestId];
-            if (requestRowIndex === undefined)
+            if (requestRowIndex === undefined) {
+                missingRequestRows += 1;
+                detailLines.push(`requestId=${requestId}: 更新依頼の行が見つからないためスキップ`);
                 continue;
+            }
             const requestRow = requestData[requestRowIndex];
             const dept = getCellValue(requestRow, requestHeader['管理部門']);
             const currentApproval = getCellValue(requestRow, requestHeader['承認ステータス']);
-            if (input === APPROVAL_INPUT.APPROVE && currentApproval === APPROVAL_STATUS.APPROVED)
+            if (input === APPROVAL_INPUT.APPROVE && currentApproval === APPROVAL_STATUS.APPROVED) {
+                skippedSameRows += 1;
                 continue;
-            if (input === APPROVAL_INPUT.RETURN && currentApproval === APPROVAL_STATUS.RETURNED)
+            }
+            if (input === APPROVAL_INPUT.RETURN && currentApproval === APPROVAL_STATUS.RETURNED) {
+                skippedSameRows += 1;
                 continue;
+            }
             if (input === APPROVAL_INPUT.APPROVE) {
                 requestRow[requestHeader['承認ステータス'] - 1] = APPROVAL_STATUS.APPROVED;
                 requestRow[requestHeader['承認者'] - 1] = approverEmail;
@@ -1520,8 +1695,12 @@ function applyApprovalDecisions() {
                 }
                 // 車両管理担当へ通知
                 const to = settings.vehicleManagerTo;
-                if (!to) {
+                if (!settings.mailSendEnabled) {
+                    detailLines.push(`承認: requestId=${requestId} メール送信スキップ（通知_メール送信=FALSE）`);
+                }
+                else if (!to) {
                     appendNotificationLog('承認結果通知', dept, '', requestId, '車両管理担当_通知先Toが未設定');
+                    detailLines.push(`承認: requestId=${requestId} 車両管理担当_通知先Toが未設定のため通知できません`);
                 }
                 else {
                     const vehicles = vehicleData
@@ -1550,14 +1729,18 @@ function applyApprovalDecisions() {
                         });
                         requestRow[requestHeader['車両管理通知送信日時'] - 1] = now;
                         appendNotificationLog('承認結果通知', dept, to, requestId, '成功');
+                        detailLines.push(`承認: requestId=${requestId} 結果通知 送信成功 -> ${to}`);
                     }
                     catch (err) {
                         appendNotificationLog('承認結果通知', dept, to, requestId, `失敗: ${err}`);
+                        detailLines.push(`承認: requestId=${requestId} 結果通知 送信失敗 -> ${to} / ${err}`);
                     }
                 }
                 // 承認済はフォームを閉じる（差戻し再回答の窓を閉じるため）
                 closeRequestForms(requestId);
+                closeApprovalFormByRequestRow(requestRow, requestHeader);
                 processed += 1;
+                approvedRows += 1;
             }
             if (input === APPROVAL_INPUT.RETURN) {
                 const comment = getCellValue(row, approvalHeader['差戻しコメント']);
@@ -1566,8 +1749,12 @@ function applyApprovalDecisions() {
                 requestRow[requestHeader['承認日時'] - 1] = now;
                 requestRow[requestHeader['差戻しコメント'] - 1] = comment || '';
                 const deptInfo = deptMaster[dept];
-                if (!deptInfo || !deptInfo.active || !deptInfo.to) {
+                if (!settings.mailSendEnabled) {
+                    detailLines.push(`差戻し: requestId=${requestId} メール送信スキップ（通知_メール送信=FALSE）`);
+                }
+                else if (!deptInfo || !deptInfo.active || !deptInfo.to) {
                     appendNotificationLog('差戻し通知', dept, '', requestId, '部署マスタ未登録/無効/通知先Toなし');
+                    detailLines.push(`差戻し: requestId=${requestId} 部署マスタの通知先Toが無い/無効のため通知できません`);
                 }
                 else {
                     const formUrls = extractFormUrlsFromRequestRow(requestRow, requestHeader);
@@ -1594,22 +1781,58 @@ function applyApprovalDecisions() {
                             body,
                         });
                         appendNotificationLog('差戻し通知', dept, deptInfo.to, requestId, '成功');
+                        detailLines.push(`差戻し: requestId=${requestId} 通知 送信成功 -> ${deptInfo.to}`);
                     }
                     catch (err) {
                         appendNotificationLog('差戻し通知', dept, deptInfo.to, requestId, `失敗: ${err}`);
+                        detailLines.push(`差戻し: requestId=${requestId} 通知 送信失敗 -> ${deptInfo.to} / ${err}`);
                     }
                 }
+                closeApprovalFormByRequestRow(requestRow, requestHeader);
                 processed += 1;
+                returnedRows += 1;
             }
         }
+        // 入力値があるが承認/差戻し以外のものは「無視」されるため、ユーザーに見える化する
+        if (inputRows > 0) {
+            for (let i = 1; i < approvalData.length; i++) {
+                const row = approvalData[i];
+                const requestId = getCellValue(row, approvalHeader['requestId']);
+                if (!requestId)
+                    continue;
+                const input = getCellValue(row, approvalHeader['承認入力']);
+                if (!input)
+                    continue;
+                if (input === APPROVAL_INPUT.APPROVE || input === APPROVAL_INPUT.RETURN)
+                    continue;
+                invalidInputRows += 1;
+                detailLines.push(`requestId=${requestId}: 承認入力が不正（'${input}'）のため無視。'承認' または '差戻し' を入力してください。`);
+            }
+        }
+        reportLines.push(`入力行: ${inputRows}件`);
+        reportLines.push(`反映: ${processed}件（承認:${approvedRows} / 差戻し:${returnedRows}）`);
+        if (skippedSameRows > 0)
+            reportLines.push(`スキップ: 既に同じステータス ${skippedSameRows}件`);
+        if (missingRequestRows > 0)
+            reportLines.push(`スキップ: 更新依頼が見つからない ${missingRequestRows}件`);
+        if (invalidInputRows > 0)
+            reportLines.push(`注意: 不正な承認入力 ${invalidInputRows}件`);
         if (processed > 0) {
             requestSheet.getRange(1, 1, requestData.length, requestData[0].length).setValues(requestData);
             if (vehicleData.length > 1) {
                 vehicleSheet.getRange(1, 1, vehicleData.length, vehicleData[0].length).setValues(vehicleData);
             }
             buildApprovalQueueSheetInternal();
-            uiAlertSafe(`承認結果を反映しました（処理件数: ${processed}）。`);
         }
+        const body = [
+            ...reportLines,
+            '',
+            `補足: 送信結果の詳細は「${SHEET_NAMES.NOTIFY_LOG}」タブにも記録されます。`,
+            '',
+            '詳細:',
+            ...(detailLines.length > 0 ? detailLines : ['（なし）']),
+        ].join('\n');
+        uiShowModalSafe('承認結果反映（通知送信）', body);
     }
     finally {
         lock.releaseLock();
@@ -2493,6 +2716,27 @@ function resolveSourceHeaders(headerMap) {
             '所属部署',
             '所属部門',
         ]),
+        manager: findHeaderIndex(headerMap, normalizedMap, [
+            '管理担当者',
+            '担当者',
+            '管理担当',
+            '担当',
+            '責任者',
+        ]),
+        contractTerm: findHeaderIndex(headerMap, normalizedMap, ['契約期間', 'リース期間', '契約年数', '期間']),
+        inspectionEnd: findHeaderIndex(headerMap, normalizedMap, [
+            '車検満了日',
+            '車検満了',
+            '車検期限',
+            '車検期限日',
+        ]),
+        leaseFee: findHeaderIndex(headerMap, normalizedMap, [
+            'リース料（税抜）',
+            'リース料(税抜)',
+            'リース料税抜',
+            'リース料',
+            '月額リース料',
+        ]),
     };
 }
 function normalizeHeaderKey(value) {
@@ -2691,6 +2935,17 @@ function toStringValue(value, fallback) {
         return fallback;
     return String(value);
 }
+function normalizeAnswerLabel(value) {
+    const text = String(value || '').trim();
+    if (!text)
+        return '';
+    if (text === ANSWER_LABELS.RENEW || text === ANSWER_LABELS.CANCELLATION_REPLACE || text === ANSWER_LABELS.CANCELLATION_END) {
+        return text;
+    }
+    if (LEGACY_ANSWER_LABEL_MAP[text])
+        return LEGACY_ANSWER_LABEL_MAP[text];
+    return '';
+}
 function pickFirstActiveDept(deptMaster) {
     const keys = Object.keys(deptMaster);
     for (const key of keys) {
@@ -2856,15 +3111,11 @@ function createRequestForms(params) {
             form.setDescription(buildFormDescription(params, index, parts, params.tz));
             form.setConfirmationMessage('回答を受け付けました。ありがとうございました。');
             ensureFormExplanationHeader(form);
-            const responderItem = form.addTextItem();
-            responderItem.setTitle(FORM_ITEM_TITLES.RESPONDER);
             const gridItem = form.addGridItem();
             gridItem.setTitle(FORM_ITEM_TITLES.POLICY_GRID);
             gridItem.setRows(chunk.map((row, rowIndex) => buildFormVehicleRowLabel(row, params.vehicleHeader, params.tz, rowIndex)));
             gridItem.setColumns(ANSWER_OPTIONS);
             gridItem.setRequired(true);
-            const commentItem = form.addParagraphTextItem();
-            commentItem.setTitle(FORM_ITEM_TITLES.COMMENT);
             const vehicleIds = chunk.map((row) => getCellValue(row, params.vehicleHeader['vehicleId']) || '');
             props.setProperty(buildFormVehicleIdsPropKey(form.getId()), JSON.stringify(vehicleIds));
             const trigger = ScriptApp.newTrigger('onRequestFormSubmit').forForm(form).onFormSubmit().create();
@@ -2894,6 +3145,146 @@ function createRequestForms(params) {
         };
     }
 }
+function createOrUpdateApprovalForm(params) {
+    try {
+        let form = null;
+        if (params.existingFormId) {
+            try {
+                form = FormApp.openById(params.existingFormId);
+            }
+            catch (err) {
+                form = null;
+            }
+        }
+        if (!form) {
+            form = FormApp.create(`【承認依頼】${params.dept} ${params.requestId}`);
+        }
+        applyFormPublicSettings(form);
+        form.setShowLinkToRespondAgain(false);
+        form.setTitle(`【承認依頼】${params.dept} ${params.requestId}`);
+        form.setDescription(buildApprovalFormDescription(params));
+        form.setConfirmationMessage('承認判断を受け付けました。ありがとうございました。');
+        form.setAcceptingResponses(true);
+        ensureApprovalDecisionItems(form);
+        const triggerId = ensureApprovalFormSubmitTrigger(form);
+        PropertiesService.getDocumentProperties().setProperty(buildApprovalFormRequestIdPropKey(form.getId()), params.requestId);
+        return {
+            ok: true,
+            message: '',
+            formId: form.getId(),
+            formUrl: form.getPublishedUrl(),
+            formEditUrl: form.getEditUrl(),
+            formTriggerId: triggerId,
+        };
+    }
+    catch (err) {
+        return {
+            ok: false,
+            message: err ? String(err) : '承認フォーム作成に失敗しました',
+            formId: '',
+            formUrl: '',
+            formEditUrl: '',
+            formTriggerId: '',
+        };
+    }
+}
+function buildApprovalFormDescription(params) {
+    const startLabel = params.targetStart ? formatDateLabel(params.targetStart, params.tz) : '-';
+    const endLabel = params.targetEnd ? formatDateLabel(params.targetEnd, params.tz) : '-';
+    const lines = [
+        `requestId: ${params.requestId}`,
+        `管理部門: ${params.dept || '-'}`,
+        `対象期間: ${startLabel}〜${endLabel}`,
+        `一次回答サマリ: ${params.summaryText || '-'}`,
+        '',
+        '対象車両:',
+        params.vehiclesText || '（対象車両なし）',
+        '',
+        'ご確認項目: 承認 または 差戻し を選択してください。',
+        '※差戻しを選ぶ場合は、差戻しコメントを入力してください。',
+        '※このフォームURLは転送しないでください。',
+    ];
+    return lines.join('\n');
+}
+function ensureApprovalDecisionItems(form) {
+    const allItems = form.getItems();
+    let decisionItem = null;
+    let commentItem = null;
+    allItems.forEach((item) => {
+        const title = item.getTitle();
+        if (title === APPROVAL_FORM_TITLES.DECISION && item.getType() === FormApp.ItemType.MULTIPLE_CHOICE) {
+            decisionItem = item.asMultipleChoiceItem();
+            return;
+        }
+        if (title === APPROVAL_FORM_TITLES.COMMENT && item.getType() === FormApp.ItemType.PARAGRAPH_TEXT) {
+            commentItem = item.asParagraphTextItem();
+        }
+    });
+    if (!decisionItem) {
+        decisionItem = form.addMultipleChoiceItem();
+        decisionItem.setTitle(APPROVAL_FORM_TITLES.DECISION);
+    }
+    decisionItem.setChoiceValues([APPROVAL_INPUT.APPROVE, APPROVAL_INPUT.RETURN]);
+    decisionItem.setRequired(true);
+    if (!commentItem) {
+        commentItem = form.addParagraphTextItem();
+        commentItem.setTitle(APPROVAL_FORM_TITLES.COMMENT);
+    }
+    commentItem.setHelpText('差戻し時は理由を記入してください。');
+}
+function ensureApprovalFormSubmitTrigger(form) {
+    const formId = form.getId();
+    const triggers = ScriptApp.getProjectTriggers();
+    const existing = triggers.find((trigger) => {
+        if (trigger.getHandlerFunction() !== 'onApprovalFormSubmit')
+            return false;
+        const sourceId = typeof trigger.getTriggerSourceId === 'function' ? trigger.getTriggerSourceId() : '';
+        return sourceId === formId;
+    });
+    if (existing) {
+        return typeof existing.getUniqueId === 'function' ? existing.getUniqueId() : '';
+    }
+    const trigger = ScriptApp.newTrigger('onApprovalFormSubmit').forForm(form).onFormSubmit().create();
+    return typeof trigger.getUniqueId === 'function' ? trigger.getUniqueId() : '';
+}
+function buildApprovalFormRequestIdPropKey(formId) {
+    return `${APPROVAL_FORM_REQUEST_ID_PROP_PREFIX}${formId}`;
+}
+function findRequestByApprovalFormId(formId) {
+    const sheet = getSpreadsheet().getSheetByName(SHEET_NAMES.REQUESTS);
+    if (!sheet)
+        return null;
+    const data = sheet.getDataRange().getValues();
+    if (data.length <= 1)
+        return null;
+    const headerMap = getHeaderMap(data[0]);
+    const formIdIndex = headerMap['承認フォームID'];
+    const requestIdIndex = headerMap['requestId'];
+    if (!formIdIndex || !requestIdIndex)
+        return null;
+    for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        if (getCellValue(row, formIdIndex) !== formId)
+            continue;
+        return { requestId: getCellValue(row, requestIdIndex), rowIndex: i + 1 };
+    }
+    const requestId = PropertiesService.getDocumentProperties().getProperty(buildApprovalFormRequestIdPropKey(formId)) || '';
+    if (!requestId)
+        return null;
+    return { requestId, rowIndex: 0 };
+}
+function closeApprovalFormByRequestRow(row, headerMap) {
+    const formId = getCellValue(row, headerMap['承認フォームID']);
+    if (!formId)
+        return;
+    try {
+        const form = FormApp.openById(formId);
+        form.setAcceptingResponses(false);
+    }
+    catch (err) {
+        Logger.log(`closeApprovalFormByRequestRow: ${formId} ${err}`);
+    }
+}
 function applyFormPublicSettings(form) {
     form.setRequireLogin(false);
     form.setCollectEmail(false);
@@ -2910,9 +3301,9 @@ function ensureFormExplanationHeader(form) {
     const header = form.addSectionHeaderItem();
     header.setTitle('ご回答方法');
     header.setHelpText([
-        '1) 「更新方針（車両ごと）」は必須です（未定も選べます）。',
-        '2) 車両の並びは、通知メールの一覧と同じ順です。',
-        '3) 「コメント（任意）」は全体コメント、または「1: コメント」のように番号で車両別コメントも書けます。',
+        '1) 「更新方針（車両ごと）」は必須です。',
+        `2) 回答は「${ANSWER_OPTIONS.join(' / ')}」から選択してください。`,
+        '3) 車両の並びは、通知メールの一覧と同じ順です。',
         '※このフォームのURLは転送しないでください。',
     ].join('\n'));
     moveLastItemToTop(form);
@@ -3000,6 +3391,7 @@ function buildFormDescription(params, index, total, tz) {
         total > 1 ? `Part${index + 1}/${total}` : '',
         `対象期間: ${startLabel}〜${endLabel}`,
         `締切: ${deadlineLabel}`,
+        `選択肢: ${ANSWER_OPTIONS.join(' / ')}`,
         '※このフォームのURLは転送しないでください。',
     ].filter((line) => line);
     return lines.join('\n');
@@ -3010,10 +3402,37 @@ function buildFormVehicleRowLabel(row, headerMap, tz, rowIndex) {
 }
 function formatFormVehicleLineShort(row, headerMap, tz, rowIndex) {
     const reg = getCellValue(row, headerMap['登録番号_結合']);
-    const label = reg || `車両${rowIndex + 1}`;
+    const type = getCellValue(row, headerMap['車種']);
+    const chassis = getCellValue(row, headerMap['車台番号']);
+    const dept = getCellValue(row, headerMap['管理部門']);
+    const manager = getCellValue(row, headerMap['管理担当者']);
+    const start = parseDateValue(getCellRaw(row, headerMap['契約開始日']));
     const end = parseDateValue(getCellRaw(row, headerMap['契約満了日']));
+    const contractTerm = getCellValue(row, headerMap['契約期間']);
+    const inspectionEnd = parseDateValue(getCellRaw(row, headerMap['車検満了日']));
+    const leaseFee = getCellValue(row, headerMap['リース料（税抜）']);
+    const startLabel = start ? formatDateIsoLabel(start, tz) : '未設定';
     const endLabel = end ? formatDateIsoLabel(end, tz) : '未設定';
-    return `【${rowIndex + 1}】${label}（満了日:${endLabel}）`;
+    const inspectionLabel = inspectionEnd ? formatDateIsoLabel(inspectionEnd, tz) : '未設定';
+    const numberLabel = reg || `車両${rowIndex + 1}`;
+    const typeLabel = type || '車種未設定';
+    const chassisLabel = chassis || '車台番号未設定';
+    const managerLabel = manager || '-';
+    const deptLabel = dept || '-';
+    const termLabel = contractTerm || '-';
+    const leaseFeeLabel = leaseFee || '-';
+    return [
+        `【${rowIndex + 1}】登録番号:${numberLabel}`,
+        `車種:${typeLabel}`,
+        `車台番号:${chassisLabel}`,
+        `管理部門:${deptLabel}`,
+        `管理担当者:${managerLabel}`,
+        `契約開始日:${startLabel}`,
+        `契約満了日:${endLabel}`,
+        `契約期間:${termLabel}`,
+        `車検満了日:${inspectionLabel}`,
+        `リース料(税抜):${leaseFeeLabel}`,
+    ].join(' / ');
 }
 function getFormIdFromEvent(e) {
     try {
@@ -3065,24 +3484,13 @@ function findRequestByFormId(formId) {
 }
 function extractAnswersFromFormResponse(formId, response) {
     const result = {
-        responder: '',
-        commentText: '',
         answersByVehicleId: {},
     };
     const vehicleIdsForForm = loadVehicleIdsForForm(formId);
     const itemResponses = response.getItemResponses();
     itemResponses.forEach((itemResponse) => {
         const item = itemResponse.getItem();
-        const title = item.getTitle();
         const type = item.getType();
-        if (title === FORM_ITEM_TITLES.RESPONDER) {
-            result.responder = String(itemResponse.getResponse() || '').trim();
-            return;
-        }
-        if (title === FORM_ITEM_TITLES.COMMENT) {
-            result.commentText = String(itemResponse.getResponse() || '').trim();
-            return;
-        }
         if (type === FormApp.ItemType.GRID) {
             const gridAnswers = extractAnswersFromGridItem(item, itemResponse, vehicleIdsForForm);
             Object.keys(gridAnswers).forEach((vehicleId) => {
