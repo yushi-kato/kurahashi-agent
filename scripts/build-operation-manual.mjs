@@ -3,7 +3,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const inputPath = path.join(repoRoot, 'docs', 'operation_manual_vehicle_lease_renewal.md');
+const inputCandidates = [
+  path.join(repoRoot, 'docs', 'operations', 'operation_manual_vehicle_lease_renewal.md'),
+  path.join(repoRoot, 'docs', 'operation_manual_vehicle_lease_renewal.md'),
+];
+const inputPath = inputCandidates.find((candidate) => fs.existsSync(candidate));
 const outputPath = path.join(repoRoot, 'dist', 'operation_manual_vehicle_lease_renewal.html');
 
 function escapeHtml(text) {
@@ -179,6 +183,9 @@ ${bodyHtml}
 }
 
 fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+if (!inputPath) {
+  throw new Error(`運用マニュアルMarkdownが見つかりません: ${inputCandidates.join(', ')}`);
+}
 const md = fs.readFileSync(inputPath, 'utf8');
 const bodyHtml = markdownToHtml(md);
 const doc = buildHtmlDocument(bodyHtml);

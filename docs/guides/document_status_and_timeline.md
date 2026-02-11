@@ -27,6 +27,7 @@
 4. 2026-02-06: 半期一括運用への転換案を確定（部署単位から半期バッチへ）
 5. 2026-02-11: 実装レビューで「半期一括案は主要部分が未実装」と確認
 6. 2026-02-11: 不要機能棚卸しと「削除 + 新規実装」を統合した移行計画を作成
+7. 2026-02-11: 移行計画に基づき、フェーズ1（通知バッチ・半期設定キー・確認用シート生成）の実装着手
 
 ## 3. 現在の読み分け（重要）
 
@@ -37,7 +38,7 @@
 - `docs/plans/plan_vehicle_lease_renewal_hq_biannual_migration_and_rebuild.md`
 
 上記は「どこへ向かうか」の基準です。  
-ただし、`docs/reviews/review_vehicle_lease_renewal_hq_biannual_confirmation_implementation.md` の通り、現行コードはまだ追随していません。
+`docs/reviews/review_vehicle_lease_renewal_hq_biannual_confirmation_implementation.md` の指摘どおり全体移行は未完了だが、最新計画に沿ったフェーズ1実装には着手済みです。
 
 ### 3.2 実装としての最新（現行運用）
 
@@ -79,7 +80,7 @@
 | `docs/briefs/brief_vehicle_lease_renewal_changes_for_inoue.md` | 井上さん向け要点 | 中間検討 | 説明履歴 |
 | `docs/briefs/brief_vehicle_lease_renewal_changes_for_senmu.md` | 専務向け要点 | 中間検討 | 説明履歴 |
 | `docs/plans/plan_vehicle_lease_renewal_hq_biannual_confirmation.md` | 半期一括の確定計画 | 次期要件基準 | 目標として最新 |
-| `docs/plans/plan_vehicle_lease_renewal_hq_biannual_migration_and_rebuild.md` | 半期一括への移行計画（削除 + 新規実装統合） | 次期要件基準 | 実装着手の正本（最新） |
+| `docs/plans/plan_vehicle_lease_renewal_hq_biannual_migration_and_rebuild.md` | 半期一括への移行計画（削除 + 新規実装統合） | 次期要件基準 | 実装着手の正本（最新、フェーズ1着手済み） |
 | `docs/flows/business_flow_vehicle_lease_renewal_hq_biannual_confirmation.md` | 半期一括の業務定義 | 次期要件基準 | 目標として最新 |
 | `docs/reviews/review_vehicle_lease_renewal_hq_biannual_confirmation_implementation.md` | 実装との差分レビュー | 差分監査 | 2026-02-11時点の実装実態を示す最新 |
 | `docs/reviews/review_obsolete_features_for_hq_biannual_migration.md` | 不要機能の棚卸し（削除候補一覧） | 差分監査 | 移行時の削除範囲を固定する基準 |

@@ -14,6 +14,7 @@ const SHEET_NAMES = {
   SUMMARY: '回答集計',
   APPROVAL_QUEUE: '承認待ち一覧',
   TEST_RESULTS: 'テスト結果',
+  NOTIFY_BATCH: '通知バッチ',
 } as const;
 
 const SOURCE_SHEETS = ['車両一覧', '車両一覧【ｹﾝｽｲ】', '車両一覧【ﾈｸｽﾄ】'];
@@ -55,6 +56,37 @@ const LEGACY_ANSWER_LABEL_MAP: { [key: string]: string } = {
   新車入替: ANSWER_LABELS.CANCELLATION_REPLACE,
   廃止: ANSWER_LABELS.CANCELLATION_END,
 };
+const BIANNUAL_BATCH_STATUS = {
+  CREATED: '作成済',
+  INITIAL_SENT: '初回通知送信済',
+  REMINDER_SENT: 'リマインド送信済',
+  SENMU_REQUESTED: '専務依頼送信済',
+  COMPLETED: '反映完了',
+} as const;
+const HQ_CONFIRMATION_SHEET_PREFIX = '本部長副本部長確認_';
+const HQ_CONFIRMATION_HEADERS = [
+  'batchId',
+  'vehicleId',
+  '管理部門',
+  '管理担当者',
+  '登録番号',
+  '車種',
+  '車台番号',
+  '契約開始日',
+  '契約満了日',
+  '契約期間',
+  '車検満了日',
+  'リース料（税抜）',
+  '本部回答',
+  '回答確認済み',
+  '専務判断',
+  '専務コメント',
+  '新契約開始日',
+  '新契約満了日',
+  '解約完了',
+  'マスター反映済み',
+  '反映日時',
+];
 const MAX_VEHICLES_PER_FORM = 50;
 const FORM_ITEM_TITLES = {
   POLICY_GRID: '更新方針（車両ごと）',
@@ -196,6 +228,26 @@ const SCHEMA_DEFS = [
     headerRow: 1,
     headers: ['実行日時', '項目', '結果', '詳細'],
   },
+  {
+    name: SHEET_NAMES.NOTIFY_BATCH,
+    headerRow: 1,
+    headers: [
+      'batchId',
+      '便区分',
+      '送付予定日',
+      '回答期限',
+      '対象開始日',
+      '対象終了日',
+      '対象件数',
+      '確認用シート名',
+      '初回通知送信日時',
+      'リマインド送信日時',
+      '専務依頼送信日時',
+      'ステータス',
+      '作成日時',
+      '更新日時',
+    ],
+  },
 ];
 
 const SETTINGS_DEFAULTS: { [key: string]: string | number | boolean } = {
@@ -219,6 +271,14 @@ const SETTINGS_DEFAULTS: { [key: string]: string | number | boolean } = {
   承認者_通知先Cc: '',
   車両管理担当_通知先To: '',
   車両管理担当_通知先Cc: '',
+  本部長副本部長_通知先To: '',
+  専務_通知先To: '',
+  専務_通知先Cc: '',
+  半期送付日_3月: '03-01',
+  半期送付日_9月: '09-01',
+  回答期限_3月: '03-31',
+  回答期限_9月: '09-30',
+  リマインド_期限前日数: 10,
 };
 
 const SCHEMA_VERSION = '1';
@@ -247,6 +307,9 @@ function onOpen() {
     .addItem('承認待ち一覧更新', 'buildApprovalQueueSheet')
     .addItem('承認依頼メール送信', 'sendApprovalRequestEmails')
     .addItem('承認結果反映（通知送信）', 'applyApprovalDecisions')
+    .addSeparator()
+    .addItem('半期バッチ起票', 'createBiannualBatch')
+    .addItem('確認用シート生成（最新バッチ）', 'buildConfirmationSheetForLatestBatch')
     .addSeparator()
     .addItem('設定ひな形作成', 'seedSettings')
     .addItem('部署トークン生成(空欄のみ)', 'generateDeptTokens')
@@ -533,6 +596,187 @@ function syncVehicles() {
   } finally {
     lock.releaseLock();
   }
+}
+
+function createBiannualBatch() {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    const ss = getSpreadsheet();
+    ensureHeaders(ensureSheet(ss, SHEET_NAMES.NOTIFY_BATCH), 1, getSchemaHeaders(SHEET_NAMES.NOTIFY_BATCH));
+    ensureHeaders(ensureSheet(ss, SHEET_NAMES.VEHICLE_VIEW), 1, getSchemaHeaders(SHEET_NAMES.VEHICLE_VIEW));
+
+    const settings = loadSettings();
+    const tz = ss.getSpreadsheetTimeZone();
+    const batchDef = resolveBiannualBatchDefinition(new Date(), tz, settings);
+    const notifyBatchSheet = ss.getSheetByName(SHEET_NAMES.NOTIFY_BATCH);
+    if (!notifyBatchSheet) throw new Error('通知バッチシートが存在しません');
+
+    const batchData = notifyBatchSheet.getDataRange().getValues();
+    const batchHeader = batchData.length > 0 ? getHeaderMap(batchData[0]) : {};
+    const existing = findNotifyBatchRow(batchData, batchHeader, batchDef.batchId);
+    if (existing) {
+      uiAlertSafe(`通知バッチ ${batchDef.batchId} は既に存在します。`);
+      return batchDef.batchId;
+    }
+
+    const vehicleContext = loadVehicleViewContext();
+    const targetVehicles = pickVehiclesByContractEndRange(
+      vehicleContext.rows,
+      vehicleContext.headerMap,
+      batchDef.targetStart,
+      batchDef.targetEnd,
+      tz,
+    );
+
+    const now = new Date();
+    const newRow = new Array(getSchemaHeaders(SHEET_NAMES.NOTIFY_BATCH).length).fill('');
+    const setCell = (headerName: string, value: any) => {
+      const idx = batchHeader[headerName];
+      if (idx) newRow[idx - 1] = value;
+    };
+    setCell('batchId', batchDef.batchId);
+    setCell('便区分', batchDef.label);
+    setCell('送付予定日', batchDef.sendDate);
+    setCell('回答期限', batchDef.deadline);
+    setCell('対象開始日', batchDef.targetStart);
+    setCell('対象終了日', batchDef.targetEnd);
+    setCell('対象件数', targetVehicles.length);
+    setCell('確認用シート名', '');
+    setCell('初回通知送信日時', '');
+    setCell('リマインド送信日時', '');
+    setCell('専務依頼送信日時', '');
+    setCell('ステータス', BIANNUAL_BATCH_STATUS.CREATED);
+    setCell('作成日時', now);
+    setCell('更新日時', now);
+
+    notifyBatchSheet.getRange(notifyBatchSheet.getLastRow() + 1, 1, 1, newRow.length).setValues([newRow]);
+    const confirmationSheetName = buildConfirmationSheet(batchDef.batchId);
+    uiAlertSafe(
+      `半期バッチを起票しました。\n` +
+        `batchId: ${batchDef.batchId}\n` +
+        `対象期間: ${formatDateLabel(batchDef.targetStart, tz)}〜${formatDateLabel(batchDef.targetEnd, tz)}\n` +
+        `対象件数: ${targetVehicles.length}件\n` +
+        `確認用シート: ${confirmationSheetName}`,
+    );
+    return batchDef.batchId;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function buildConfirmationSheetForLatestBatch() {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    const ss = getSpreadsheet();
+    const notifyBatchSheet = ss.getSheetByName(SHEET_NAMES.NOTIFY_BATCH);
+    if (!notifyBatchSheet || notifyBatchSheet.getLastRow() <= 1) {
+      uiAlertSafe('通知バッチにデータがありません。先に半期バッチを起票してください。');
+      return '';
+    }
+    const data = notifyBatchSheet.getDataRange().getValues();
+    const headerMap = getHeaderMap(data[0]);
+    const batchIdIndex = headerMap['batchId'];
+    if (!batchIdIndex) throw new Error('通知バッチの batchId 列が見つかりません');
+
+    let latestBatchId = '';
+    for (let i = data.length - 1; i >= 1; i--) {
+      const batchId = getCellValue(data[i], batchIdIndex);
+      if (!batchId) continue;
+      latestBatchId = batchId;
+      break;
+    }
+    if (!latestBatchId) {
+      uiAlertSafe('通知バッチの batchId が見つかりません。');
+      return '';
+    }
+
+    const sheetName = buildConfirmationSheet(latestBatchId);
+    uiAlertSafe(`最新バッチ ${latestBatchId} の確認用シートを生成しました。\nシート名: ${sheetName}`);
+    return sheetName;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function buildConfirmationSheet(batchId: string) {
+  const ss = getSpreadsheet();
+  const tz = ss.getSpreadsheetTimeZone();
+  const notifyBatchSheet = ss.getSheetByName(SHEET_NAMES.NOTIFY_BATCH);
+  if (!notifyBatchSheet) throw new Error('通知バッチシートが存在しません');
+  ensureHeaders(notifyBatchSheet, 1, getSchemaHeaders(SHEET_NAMES.NOTIFY_BATCH));
+
+  const batchData = notifyBatchSheet.getDataRange().getValues();
+  if (batchData.length <= 1) throw new Error('通知バッチにデータがありません');
+  const batchHeader = getHeaderMap(batchData[0]);
+  const batchRowInfo = findNotifyBatchRow(batchData, batchHeader, batchId);
+  if (!batchRowInfo) throw new Error(`通知バッチが見つかりません: ${batchId}`);
+
+  const batchRow = batchRowInfo.row;
+  const targetStart = parseDateValue(getCellRaw(batchRow, batchHeader['対象開始日']));
+  const targetEnd = parseDateValue(getCellRaw(batchRow, batchHeader['対象終了日']));
+  if (!targetStart || !targetEnd) {
+    throw new Error(`通知バッチの対象期間が不正です: ${batchId}`);
+  }
+
+  const vehicleContext = loadVehicleViewContext();
+  const targetVehicles = pickVehiclesByContractEndRange(vehicleContext.rows, vehicleContext.headerMap, targetStart, targetEnd, tz);
+
+  const sendDate = parseDateValue(getCellRaw(batchRow, batchHeader['送付予定日'])) || new Date();
+  const sheetStamp = Utilities.formatDate(sendDate, tz, 'yyyyMMdd');
+  const sheetName = buildUniqueSheetName(`${HQ_CONFIRMATION_SHEET_PREFIX}${sheetStamp}`);
+  const sheet = ensureSheet(ss, sheetName);
+  writeArbitrarySheetData(sheet, HQ_CONFIRMATION_HEADERS, []);
+
+  const vh = vehicleContext.headerMap;
+  const rows = targetVehicles.map((row) => [
+    batchId,
+    getCellValue(row, vh['vehicleId']),
+    getCellValue(row, vh['管理部門']),
+    getCellValue(row, vh['管理担当者']),
+    getCellValue(row, vh['登録番号_結合']),
+    getCellValue(row, vh['車種']),
+    getCellValue(row, vh['車台番号']),
+    getCellRaw(row, vh['契約開始日']),
+    getCellRaw(row, vh['契約満了日']),
+    getCellValue(row, vh['契約期間']),
+    getCellRaw(row, vh['車検満了日']),
+    getCellValue(row, vh['リース料（税抜）']),
+    '',
+    false,
+    '',
+    '',
+    '',
+    '',
+    false,
+    false,
+    '',
+  ]);
+
+  writeArbitrarySheetData(sheet, HQ_CONFIRMATION_HEADERS, rows);
+  const headerMap = getHeaderMap(HQ_CONFIRMATION_HEADERS);
+  if (rows.length > 0) {
+    const checkColumns = ['回答確認済み', '解約完了', 'マスター反映済み'];
+    checkColumns.forEach((name) => {
+      const col = headerMap[name];
+      if (!col) return;
+      sheet.getRange(2, col, rows.length, 1).insertCheckboxes();
+    });
+  }
+  protectSenmuColumns(sheetName);
+
+  const now = new Date();
+  const setBatchCell = (headerName: string, value: any) => {
+    const idx = batchHeader[headerName];
+    if (idx) batchRow[idx - 1] = value;
+  };
+  setBatchCell('対象件数', rows.length);
+  setBatchCell('確認用シート名', sheetName);
+  setBatchCell('更新日時', now);
+  notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
+
+  return sheetName;
 }
 
 function createRequests() {
@@ -3019,6 +3263,136 @@ function isWithinRange(date: Date, start: Date, end: Date) {
   return date.getTime() >= start.getTime() && date.getTime() <= end.getTime();
 }
 
+function resolveBiannualBatchDefinition(referenceDate: Date, tz: string, settings: ReturnType<typeof loadSettings>) {
+  const month = referenceDate.getMonth() + 1;
+  const year = referenceDate.getFullYear();
+  const isH1 = month <= 3 || month >= 10;
+
+  if (isH1) {
+    const batchYear = month >= 10 ? year + 1 : year;
+    const rangeStartYear = batchYear - 1;
+    const targetStart = toDateOnly(new Date(rangeStartYear, 9, 1), tz);
+    const targetEnd = toDateOnly(new Date(batchYear, 2, 31), tz);
+    const sendDate = resolveMonthDaySettingDate(settings.marchSendDate, batchYear, 3, 1, tz);
+    const deadline = resolveMonthDaySettingDate(settings.marchDeadline, batchYear, 3, 31, tz);
+    return {
+      batchId: `${batchYear}H1`,
+      label: `${batchYear}年3月便`,
+      sendDate,
+      deadline,
+      targetStart,
+      targetEnd,
+    };
+  }
+
+  const batchYear = year;
+  const targetStart = toDateOnly(new Date(batchYear, 3, 1), tz);
+  const targetEnd = toDateOnly(new Date(batchYear, 8, 30), tz);
+  const sendDate = resolveMonthDaySettingDate(settings.septemberSendDate, batchYear, 9, 1, tz);
+  const deadline = resolveMonthDaySettingDate(settings.septemberDeadline, batchYear, 9, 30, tz);
+  return {
+    batchId: `${batchYear}H2`,
+    label: `${batchYear}年9月便`,
+    sendDate,
+    deadline,
+    targetStart,
+    targetEnd,
+  };
+}
+
+function resolveMonthDaySettingDate(
+  rawValue: any,
+  year: number,
+  fallbackMonth: number,
+  fallbackDay: number,
+  tz: string,
+) {
+  if (rawValue instanceof Date) {
+    return toDateOnly(rawValue, tz);
+  }
+  const text = String(rawValue || '').trim();
+  if (text) {
+    const fullDateMatch = text.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/);
+    if (fullDateMatch) {
+      const parsed = new Date(Number(fullDateMatch[1]), Number(fullDateMatch[2]) - 1, Number(fullDateMatch[3]));
+      return toDateOnly(parsed, tz);
+    }
+
+    const monthDayMatch = text.match(/^(\d{1,2})[/-](\d{1,2})$/);
+    if (monthDayMatch) {
+      const parsed = new Date(year, Number(monthDayMatch[1]) - 1, Number(monthDayMatch[2]));
+      return toDateOnly(parsed, tz);
+    }
+
+    const jpMonthDayMatch = text.match(/^(\d{1,2})月(\d{1,2})日?$/);
+    if (jpMonthDayMatch) {
+      const parsed = new Date(year, Number(jpMonthDayMatch[1]) - 1, Number(jpMonthDayMatch[2]));
+      return toDateOnly(parsed, tz);
+    }
+  }
+  return toDateOnly(new Date(year, fallbackMonth - 1, fallbackDay), tz);
+}
+
+function findNotifyBatchRow(batchData: any[][], headerMap: { [key: string]: number }, batchId: string) {
+  const batchIdIndex = headerMap['batchId'];
+  if (!batchIdIndex) return null;
+  for (let i = 1; i < batchData.length; i++) {
+    const row = batchData[i];
+    if (getCellValue(row, batchIdIndex) !== batchId) continue;
+    return { row, rowIndex: i + 1 };
+  }
+  return null;
+}
+
+function loadVehicleViewContext() {
+  const ss = getSpreadsheet();
+  const vehicleSheet = ss.getSheetByName(SHEET_NAMES.VEHICLE_VIEW);
+  if (!vehicleSheet) throw new Error('車両（統合ビュー）が存在しません。先に車両統合ビュー同期を実行してください。');
+  ensureHeaders(vehicleSheet, 1, getSchemaHeaders(SHEET_NAMES.VEHICLE_VIEW));
+  const vehicleData = vehicleSheet.getDataRange().getValues();
+  if (vehicleData.length === 0) {
+    return { rows: [] as any[][], headerMap: {} as { [key: string]: number } };
+  }
+  const headerMap = getHeaderMap(vehicleData[0]);
+  return {
+    rows: vehicleData.slice(1),
+    headerMap,
+  };
+}
+
+function pickVehiclesByContractEndRange(
+  rows: any[][],
+  headerMap: { [key: string]: number },
+  start: Date,
+  end: Date,
+  tz: string,
+) {
+  const contractEndIndex = headerMap['契約満了日'];
+  if (!contractEndIndex) return [];
+  const startDate = toDateOnly(start, tz);
+  const endDate = toDateOnly(end, tz);
+
+  return rows.filter((row) => {
+    if (row.every((cell) => cell === '' || cell === null)) return false;
+    const contractEnd = parseDateValue(getCellRaw(row, contractEndIndex));
+    if (!contractEnd) return false;
+    const contractDate = toDateOnly(contractEnd, tz);
+    return isWithinRange(contractDate, startDate, endDate);
+  });
+}
+
+function buildUniqueSheetName(baseName: string) {
+  const ss = getSpreadsheet();
+  if (!ss.getSheetByName(baseName)) return baseName;
+  let suffix = 2;
+  while (suffix <= 99) {
+    const candidate = `${baseName}_${suffix}`;
+    if (!ss.getSheetByName(candidate)) return candidate;
+    suffix += 1;
+  }
+  throw new Error(`確認用シート名が重複しすぎています: ${baseName}`);
+}
+
 function buildRegistrationCombined(area: string, cls: string, kana: string, number: string) {
   return [area, cls, kana, number].filter((v) => v).join('');
 }
@@ -3094,6 +3468,14 @@ function loadSettings() {
     approverCc: toStringValue(values['承認者_通知先Cc'], String(SETTINGS_DEFAULTS['承認者_通知先Cc'])),
     vehicleManagerTo: toStringValue(values['車両管理担当_通知先To'], String(SETTINGS_DEFAULTS['車両管理担当_通知先To'])),
     vehicleManagerCc: toStringValue(values['車両管理担当_通知先Cc'], String(SETTINGS_DEFAULTS['車両管理担当_通知先Cc'])),
+    hqTo: toStringValue(values['本部長副本部長_通知先To'], String(SETTINGS_DEFAULTS['本部長副本部長_通知先To'])),
+    senmuTo: toStringValue(values['専務_通知先To'], String(SETTINGS_DEFAULTS['専務_通知先To'])),
+    senmuCc: toStringValue(values['専務_通知先Cc'], String(SETTINGS_DEFAULTS['専務_通知先Cc'])),
+    marchSendDate: values['半期送付日_3月'] || SETTINGS_DEFAULTS['半期送付日_3月'],
+    septemberSendDate: values['半期送付日_9月'] || SETTINGS_DEFAULTS['半期送付日_9月'],
+    marchDeadline: values['回答期限_3月'] || SETTINGS_DEFAULTS['回答期限_3月'],
+    septemberDeadline: values['回答期限_9月'] || SETTINGS_DEFAULTS['回答期限_9月'],
+    reminderBeforeDays: toNumber(values['リマインド_期限前日数'], Number(SETTINGS_DEFAULTS['リマインド_期限前日数'])),
   };
 }
 
@@ -3184,6 +3566,18 @@ function writeSheetData(sheetName: string, rows: any[][]) {
   if (sheet.getLastRow() > 1) {
     sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).clearContent();
   }
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  }
+}
+
+function writeArbitrarySheetData(sheet: GoogleAppsScript.Spreadsheet.Sheet, headers: string[], rows: any[][]) {
+  const lastRow = sheet.getLastRow();
+  const lastColumn = Math.max(sheet.getLastColumn(), headers.length);
+  if (lastRow > 0 && lastColumn > 0) {
+    sheet.getRange(1, 1, lastRow, lastColumn).clearContent();
+  }
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   if (rows.length > 0) {
     sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
   }
@@ -3951,6 +4345,59 @@ function protectViewSheet(sheetName: string) {
     }
   } catch (err) {
     Logger.log(`protectViewSheet: ${sheetName} ${err}`);
+  }
+}
+
+function protectSenmuColumns(sheetName: string) {
+  const ss = getSpreadsheet();
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return;
+  if (sheet.getLastRow() === 0) return;
+
+  const headerMap = getHeaderMap(sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]);
+  const decisionCol = headerMap['専務判断'];
+  const commentCol = headerMap['専務コメント'];
+  if (!decisionCol || !commentCol) return;
+
+  const startCol = Math.min(decisionCol, commentCol);
+  const endCol = Math.max(decisionCol, commentCol);
+  const width = endCol - startCol + 1;
+  const desc = `managed_by_script:senmu_columns:${sheetName}`;
+
+  try {
+    const protections = sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE);
+    protections.forEach((protection) => {
+      if (protection.getDescription() !== desc) return;
+      try {
+        protection.remove();
+      } catch (err) {
+        Logger.log(`protectSenmuColumns remove: ${sheetName} ${err}`);
+      }
+    });
+
+    const range = sheet.getRange(1, startCol, sheet.getMaxRows(), width);
+    const protection = range.protect();
+    protection.setDescription(desc);
+    protection.setWarningOnly(false);
+    protection.setDomainEdit(false);
+    try {
+      const editors = protection.getEditors();
+      if (editors && editors.length > 0) protection.removeEditors(editors);
+    } catch (err) {
+      Logger.log(`protectSenmuColumns removeEditors: ${sheetName} ${err}`);
+    }
+    try {
+      protection.addEditor(Session.getEffectiveUser());
+    } catch (err) {
+      Logger.log(`protectSenmuColumns add effective user: ${sheetName} ${err}`);
+    }
+    try {
+      protection.addEditor(Session.getActiveUser());
+    } catch (err) {
+      Logger.log(`protectSenmuColumns add active user: ${sheetName} ${err}`);
+    }
+  } catch (err) {
+    Logger.log(`protectSenmuColumns: ${sheetName} ${err}`);
   }
 }
 
