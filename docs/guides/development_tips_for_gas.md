@@ -39,7 +39,7 @@ GASのV8はモダンJSを使えるが、**標準APIが欠けている**。これ
 
 この案件では「スプレッドシートのタブ/ヘッダ構造」を **コードで再現可能**にする（いわゆる “Sheets migration”）。
 
-* スキーマ管理ルール（AI向け）は `gas_for_lease_management/sheet_schema_management_rules.md` を参照する。
+* スキーマ管理ルール（AI向け）は `docs/guides/sheet_schema_management_rules.md` を参照する。
 * 重要: スプレッドシートは人が触る前提のため、**列番号固定は禁止**（ヘッダ名で列解決）・**破壊的変更はmigrationとして明示**が基本。
 
 ### 1.5 TypeScript + ビルド + clasp 運用チェックリスト（つまずきポイント対策）

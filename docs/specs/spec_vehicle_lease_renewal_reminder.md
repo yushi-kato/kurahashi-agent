@@ -3,8 +3,8 @@
 - 作成日: 2026-01-20
 - 対象: 車両リース契約 更新通知（GAS / Googleフォーム回答）
 - 関連:
-  - `docs/about_this_project.md`
-  - `docs/operation_manual_vehicle_lease_renewal.md`
+  - `docs/guides/about_this_project.md`
+  - `docs/operations/operation_manual_vehicle_lease_renewal.md`
   - `src/main.ts`
 
 ## 1. 目的 / 成功条件
@@ -33,7 +33,7 @@
 ## 4. 現状（As-Is）
 - 自動送信は `sendInitialEmails()` による「初回」中心で、リマインド送信ロジックは未実装。`src/main.ts:443`
 - `runDaily()` は `createRequests()` → `sendInitialEmails()` まで実行するが、リマインド送信は呼ばない。`src/main.ts:844`
-- 運用マニュアル上も「未回答リマインドは運用でカバー」と記載がある。`docs/operation_manual_vehicle_lease_renewal.md:17`
+- 運用マニュアル上も「未回答リマインドは運用でカバー」と記載がある。`docs/operations/operation_manual_vehicle_lease_renewal.md:17`
 
 ## 5. To-Be（仕様 / 挙動）
 

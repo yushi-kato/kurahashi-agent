@@ -3,7 +3,7 @@
 ## 1. 目的
 契約満了が近い車両を自動抽出し、管理部署へ通知→Webで回答回収→集計→台帳へ反映までを省力化する。
 
-対象の仕組み（実装計画）は `docs/plan_vehicle_lease_renewal_gas.md` を参照。
+対象の仕組み（実装計画）は `docs/plans/plan_vehicle_lease_renewal_gas.md` を参照。
 
 ---
 

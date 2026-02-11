@@ -178,8 +178,8 @@
 
 ## 8. 変更対象ファイル（予定）
 - `/Users/yushi/work/work/クラハシ/src/main.ts`
-- `/Users/yushi/work/work/クラハシ/docs/business_flow_vehicle_lease_renewal.md`
-- `/Users/yushi/work/work/クラハシ/docs/operation_manual_vehicle_lease_renewal.md`
+- `/Users/yushi/work/work/クラハシ/docs/flows/business_flow_vehicle_lease_renewal.md`
+- `/Users/yushi/work/work/クラハシ/docs/operations/operation_manual_vehicle_lease_renewal.md`
 
 ## 9. テスト計画（最小必須）
 1. 3月便抽出テスト

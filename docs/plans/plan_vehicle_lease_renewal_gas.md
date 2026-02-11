@@ -4,10 +4,10 @@
 - 対象: `data/車両管理 (2).xlsx` をインポートした Google スプレッドシート + Apps Script（GAS）
 - 目的: 契約満了が近い車両を抽出し、管理部署へ通知→Webで回答回収→台帳へ反映（人手最小化）
 - 関連資料:
-  - `docs/about_this_project.md`
-  - `docs/vehicle_management_structure.md`
-  - `docs/sheet_schema_management_rules.md`
-  - `docs/business_flow_vehicle_lease_renewal.md`
+  - `docs/guides/about_this_project.md`
+  - `docs/guides/vehicle_management_structure.md`
+  - `docs/guides/sheet_schema_management_rules.md`
+  - `docs/flows/business_flow_vehicle_lease_renewal.md`
 
 ## 1. 目的 / 成功条件
 - 目的:
@@ -120,7 +120,7 @@
 - 依頼（requestId）ごとにフォームを作成し、メールにはフォームURLを記載する。
 - フォーム送信トリガーで `回答` へ取り込み → `applyAnswers()` → `回答集計` を更新する。
 - 車両数が多い部署を想定し、更新方針は「選択式グリッド」、必要ならフォーム分割（Part1/Part2…）を前提にする。
-- 詳細仕様: `docs/spec_vehicle_lease_renewal_answer_via_google_forms.md`
+- 詳細仕様: `docs/specs/spec_vehicle_lease_renewal_answer_via_google_forms.md`
 
 ### 5.5 処理フロー（MVP）
 1. `車両（統合ビュー）` を同期（3つの車両一覧から正規化・集約）
@@ -132,7 +132,7 @@
 
 ## 6. 実装ステップ（手順）
 ### フェーズ1: 最小の価値（①②④）
-1. シートスキーマをコードで管理する（`docs/sheet_schema_management_rules.md` の方針に従う）
+1. シートスキーマをコードで管理する（`docs/guides/sheet_schema_management_rules.md` の方針に従う）
 2. スプレッドシートに `設定` / `部署マスタ` / `車両（統合ビュー）` / `要入力` / `更新依頼` / `回答` / `通知ログ` を追加（不足は `syncSchema()` で非破壊作成）
 3. Apps Script（スプレッドシートに紐づけ）で以下を実装
    - スキーマ同期/ドリフト検知: `syncSchema()` / `checkSchemaDrift()`
@@ -140,7 +140,7 @@
    - 抽出/依頼作成: `createRequests()`（二重送信防止、トークン発行を含む）
    - メール送信: `sendInitialEmails()`（部署マスタ参照、部署単位で1通にまとめる）
    - Web回答: `doGet()` / `doPost()`（リンク+トークン検証）※ Webアプリ運用可能な場合
-   - フォーム回答（代替）: フォーム作成 + フォーム送信トリガーで取り込み（`docs/spec_vehicle_lease_renewal_answer_via_google_forms.md`）
+   - フォーム回答（代替）: フォーム作成 + フォーム送信トリガーで取り込み（`docs/specs/spec_vehicle_lease_renewal_answer_via_google_forms.md`）
    - 反映: `applyAnswers()`（元台帳 `sourceSheet` 側の追記列へ反映。既存列は変更しない）
    - 集計: `buildSummarySheet()`（`回答集計` を更新）
    - 集計通知: `sendSummaryEmail()`（`管理者_通知先To/Cc` 宛）

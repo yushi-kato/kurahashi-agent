@@ -4,8 +4,8 @@
 - 対象: 本リポジトリの「車両リース契約 更新通知（GAS）」一式
 - 背景資料:
   - 参考メール: `docs/references/2026-01-27_vehicle-lease-automation_email/email_body.md`
-  - 既存計画: `docs/plan_vehicle_lease_renewal_gas.md`
-  - 既存業務フロー: `docs/business_flow_vehicle_lease_renewal.md`
+  - 既存計画: `docs/plans/plan_vehicle_lease_renewal_gas.md`
+  - 既存業務フロー: `docs/flows/business_flow_vehicle_lease_renewal.md`
   - 実装（現状）: `src/main.ts`
 
 ## 1. 目的 / 成功条件
@@ -28,7 +28,7 @@
 
 ## 3. 前提 / 制約
 - GAS Webアプリは使わず、回答はGoogleフォーム中心（現状: `src/main.ts` はWeb回答を廃止メッセージにしている）
-- 本番スプレッドシートは人が触る前提のため、スキーマ変更は「列追加中心・非破壊」を優先（`docs/sheet_schema_management_rules.md`）
+- 本番スプレッドシートは人が触る前提のため、スキーマ変更は「列追加中心・非破壊」を優先（`docs/guides/sheet_schema_management_rules.md`）
 - 送信クォータ/誤送信対策として、通知は「グループ単位で1通」に寄せるのが基本方針
 
 ## 4. 現状（調査結果 / As-Is）
@@ -221,14 +221,14 @@
 
 ### フェーズ3: 完了フラグと運用の仕上げ
 1) 完了フラグ（車両単位/依頼単位）を追加し、一覧で追えるようにする
-2) `docs/operation_manual_vehicle_lease_renewal.md` を「承認/差戻し/完了」に対応させて更新
+2) `docs/operations/operation_manual_vehicle_lease_renewal.md` を「承認/差戻し/完了」に対応させて更新
 3) `runTestSuite()` に承認フローの期待値チェックを追加（可能な範囲で）
 
 ## 8. 影響範囲（変更点一覧）
 実装する場合の主な影響範囲（候補）:
 - `src/main.ts`（スキーマ/状態/通知/集計の拡張）
-- `docs/operation_manual_vehicle_lease_renewal.md`（運用追加）
-- `docs/business_flow_vehicle_lease_renewal.md`（登場人物/To-Be更新）
+- `docs/operations/operation_manual_vehicle_lease_renewal.md`（運用追加）
+- `docs/flows/business_flow_vehicle_lease_renewal.md`（登場人物/To-Be更新）
 
 ## 9. リスクと対策
 - リスク: 承認者がシートを開かない/見落とす
@@ -239,7 +239,7 @@
   - 対策: 承認は原則シート運用（案B）、フォームは一次回答に限定
 
 ## 10. テスト/検証（方針）
-- 既存の `docs/test_automation_vehicle_lease_renewal.md` の流れを踏襲し、まずはGAS内部テスト（`runTestSuite()`）を拡張する。
+- 既存の `docs/guides/test_automation_vehicle_lease_renewal.md` の流れを踏襲し、まずはGAS内部テスト（`runTestSuite()`）を拡張する。
 - 承認ステータスの遷移と「通知ログが期待通り残る」ことを最小の自動検証範囲とする。
 
 ## 11. ロールバック（戻し方）

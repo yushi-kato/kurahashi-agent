@@ -1,7 +1,7 @@
 # 共有用要点（井上さん向け）: 車両リース管理自動化「承認/差戻し」追加で何が変わるか
 
 - 作成日: 2026-02-02
-- 参照: `docs/plan_vehicle_lease_renewal_approval_flow.md`
+- 参照: `docs/plans/plan_vehicle_lease_renewal_approval_flow.md`
 
 ## 何が変わるか（要点）
 
