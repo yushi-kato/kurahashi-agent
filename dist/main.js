@@ -54,6 +54,8 @@ const BIANNUAL_BATCH_STATUS = {
     INITIAL_SENT: '初回通知送信済',
     REMINDER_SENT: 'リマインド送信済',
     SENMU_REQUESTED: '専務依頼送信済',
+    SENMU_APPROVED: '専務承認済',
+    SENMU_RETURNED: '専務差戻し',
     COMPLETED: '反映完了',
 };
 const HQ_CONFIRMATION_SHEET_PREFIX = '本部長副本部長確認_';
@@ -284,30 +286,20 @@ function onOpen() {
         .addItem('スキーマドリフト確認', 'checkSchemaDrift')
         .addSeparator()
         .addItem('車両統合ビュー同期', 'syncVehicles')
-        .addItem('更新依頼作成', 'createRequests')
-        .addItem('初回メール送信', 'sendInitialEmails')
-        .addItem('リマインド送信', 'sendReminderEmails')
-        .addSeparator()
-        .addItem('回答反映', 'applyAnswers')
-        .addItem('回答集計更新', 'buildSummarySheet')
-        .addItem('集計メール送信', 'sendSummaryEmail')
-        .addSeparator()
-        .addItem('承認待ち一覧更新', 'buildApprovalQueueSheet')
-        .addItem('承認依頼メール送信', 'sendApprovalRequestEmails')
-        .addItem('承認結果反映（通知送信）', 'applyApprovalDecisions')
-        .addSeparator()
         .addItem('半期バッチ起票', 'createBiannualBatch')
         .addItem('確認用シート生成（最新バッチ）', 'buildConfirmationSheetForLatestBatch')
+        .addItem('初回通知送信（最新バッチ）', 'sendHqInitialEmail')
+        .addItem('リマインド送信（条件一致時）', 'sendHqReminderIfNeeded')
+        .addItem('専務依頼送信（全件確認後）', 'sendSenmuApprovalRequestIfReady')
+        .addItem('専務判断反映（最新バッチ）', 'applySenmuDecisionFromSheet')
+        .addItem('マスター反映（最新バッチ）', 'applyMasterUpdates')
         .addSeparator()
         .addItem('設定ひな形作成', 'seedSettings')
-        .addItem('部署トークン生成(空欄のみ)', 'generateDeptTokens')
-        .addItem('テスト車両追加', 'seedTestVehicles')
-        .addItem('ソースシート診断', 'diagnoseSourceSheets')
         .addItem('テスト一括実行(メール送信は設定次第)', 'runTestSuite')
         .addItem('テストデータ掃除', 'cleanupTestData')
-        .addItem('日次トリガー再作成', 'installDailyTriggers')
+        .addItem('半期トリガー再作成', 'installDailyTriggers')
         .addSeparator()
-        .addItem('日次一括実行', 'runDaily')
+        .addItem('半期一括実行', 'runDaily')
         .addToUi();
 }
 function showOperationManual() {
@@ -715,6 +707,18 @@ function buildConfirmationSheet(batchId) {
                 return;
             sheet.getRange(2, col, rows.length, 1).insertCheckboxes();
         });
+        const answerCol = headerMap['本部回答'];
+        if (answerCol) {
+            const rule = SpreadsheetApp.newDataValidation().requireValueInList(ANSWER_OPTIONS, true).build();
+            sheet.getRange(2, answerCol, rows.length, 1).setDataValidation(rule);
+        }
+        const decisionCol = headerMap['専務判断'];
+        if (decisionCol) {
+            const rule = SpreadsheetApp.newDataValidation()
+                .requireValueInList([APPROVAL_INPUT.APPROVE, APPROVAL_INPUT.RETURN], true)
+                .build();
+            sheet.getRange(2, decisionCol, rows.length, 1).setDataValidation(rule);
+        }
     }
     protectSenmuColumns(sheetName);
     const now = new Date();
@@ -729,7 +733,519 @@ function buildConfirmationSheet(batchId) {
     notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
     return sheetName;
 }
+function sendHqInitialEmail(batchId) {
+    const lock = LockService.getDocumentLock();
+    lock.waitLock(30000);
+    try {
+        const settings = loadSettings();
+        const batchContext = getNotifyBatchContext(batchId);
+        if (!batchContext) {
+            uiAlertSafe('通知バッチが見つかりません。先に半期バッチ起票を実行してください。');
+            return '';
+        }
+        const { ss, notifyBatchSheet, batchData, headerMap, row } = batchContext;
+        const resolvedBatchId = batchContext.batchId;
+        const tz = ss.getSpreadsheetTimeZone();
+        const hqTo = String(settings.hqTo || '').trim();
+        if (!settings.mailSendEnabled) {
+            appendNotificationLog('半期初回通知', '', '', resolvedBatchId, '通知_メール送信=FALSE のため送信をスキップ');
+            return resolvedBatchId;
+        }
+        if (!hqTo) {
+            appendNotificationLog('半期初回通知', '', '', resolvedBatchId, '本部長副本部長_通知先Toが未設定');
+            uiAlertSafe('設定「本部長副本部長_通知先To」が未設定のため送信できません。');
+            return resolvedBatchId;
+        }
+        const sentAt = parseDateValue(getCellRaw(row, headerMap['初回通知送信日時']));
+        if (sentAt) {
+            uiAlertSafe(`初回通知は既に送信済みです。\nbatchId: ${resolvedBatchId}`);
+            return resolvedBatchId;
+        }
+        let confirmationSheetName = getCellValue(row, headerMap['確認用シート名']);
+        if (!confirmationSheetName || !ss.getSheetByName(confirmationSheetName)) {
+            confirmationSheetName = buildConfirmationSheet(resolvedBatchId);
+        }
+        const confirmationSheet = ss.getSheetByName(confirmationSheetName);
+        if (!confirmationSheet) {
+            throw new Error(`確認用シートが見つかりません: ${confirmationSheetName}`);
+        }
+        const confirmationData = confirmationSheet.getDataRange().getValues();
+        const confirmationHeader = confirmationData.length > 0 ? getHeaderMap(confirmationData[0]) : {};
+        const counts = summarizeConfirmationSheetRows(confirmationData, confirmationHeader);
+        const sheetUrl = buildSheetUrlWithGid(ss, confirmationSheet);
+        const batchLabel = getCellValue(row, headerMap['便区分']) || resolvedBatchId;
+        const deadline = parseDateValue(getCellRaw(row, headerMap['回答期限']));
+        const targetStart = parseDateValue(getCellRaw(row, headerMap['対象開始日']));
+        const targetEnd = parseDateValue(getCellRaw(row, headerMap['対象終了日']));
+        const subject = `【車両更新確認】${batchLabel} 一次確認のお願い`;
+        const body = [
+            '本部長・副本部長 各位',
+            '',
+            `${batchLabel} の車両更新確認をお願いします。`,
+            `batchId: ${resolvedBatchId}`,
+            `対象期間: ${formatDateLabel(targetStart || new Date(), tz)}〜${formatDateLabel(targetEnd || new Date(), tz)}`,
+            `回答期限: ${formatDateLabel(deadline || new Date(), tz)}`,
+            '',
+            `対象件数: ${counts.total}`,
+            `未回答件数: ${counts.unanswered}`,
+            '',
+            '確認用シート:',
+            sheetUrl,
+            '',
+            '入力ルール:',
+            `- 「本部回答」は ${ANSWER_OPTIONS.join(' / ')} から選択してください。`,
+            '- 全件入力後に「回答確認済み」をチェックしてください。',
+        ].join('\n');
+        try {
+            MailApp.sendEmail({
+                to: hqTo,
+                subject,
+                name: settings.fromName,
+                body,
+            });
+            const now = new Date();
+            row[headerMap['確認用シート名'] - 1] = confirmationSheetName;
+            row[headerMap['初回通知送信日時'] - 1] = now;
+            row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.INITIAL_SENT;
+            row[headerMap['更新日時'] - 1] = now;
+            notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
+            appendNotificationLog('半期初回通知', '', hqTo, resolvedBatchId, '成功');
+            uiAlertSafe(`初回通知を送信しました。\nbatchId: ${resolvedBatchId}`);
+        }
+        catch (err) {
+            appendNotificationLog('半期初回通知', '', hqTo, resolvedBatchId, `失敗: ${err}`);
+            throw err;
+        }
+        return resolvedBatchId;
+    }
+    finally {
+        lock.releaseLock();
+    }
+}
+function sendHqReminderIfNeeded(batchId) {
+    const lock = LockService.getDocumentLock();
+    lock.waitLock(30000);
+    try {
+        const settings = loadSettings();
+        const batchContext = getNotifyBatchContext(batchId);
+        if (!batchContext)
+            return '';
+        const { ss, notifyBatchSheet, batchData, headerMap, row } = batchContext;
+        const resolvedBatchId = batchContext.batchId;
+        const tz = ss.getSpreadsheetTimeZone();
+        const hqTo = String(settings.hqTo || '').trim();
+        if (!settings.mailSendEnabled) {
+            appendNotificationLog('半期リマインド', '', '', resolvedBatchId, '通知_メール送信=FALSE のため送信をスキップ');
+            return resolvedBatchId;
+        }
+        if (!hqTo) {
+            appendNotificationLog('半期リマインド', '', '', resolvedBatchId, '本部長副本部長_通知先Toが未設定');
+            return resolvedBatchId;
+        }
+        const reminderSentAt = parseDateValue(getCellRaw(row, headerMap['リマインド送信日時']));
+        if (reminderSentAt)
+            return resolvedBatchId;
+        const deadline = parseDateValue(getCellRaw(row, headerMap['回答期限']));
+        if (!deadline) {
+            appendNotificationLog('半期リマインド', '', hqTo, resolvedBatchId, '回答期限が未設定のためスキップ');
+            return resolvedBatchId;
+        }
+        const reminderBeforeDays = Math.max(0, toNumber(settings.reminderBeforeDays, 10));
+        const reminderDate = addDays(toDateOnly(deadline, tz), -reminderBeforeDays);
+        const today = toDateOnly(new Date(), tz);
+        if (today.getTime() < reminderDate.getTime())
+            return resolvedBatchId;
+        const confirmationSheetName = getCellValue(row, headerMap['確認用シート名']);
+        if (!confirmationSheetName) {
+            appendNotificationLog('半期リマインド', '', hqTo, resolvedBatchId, '確認用シート未設定のためスキップ');
+            return resolvedBatchId;
+        }
+        const confirmationSheet = ss.getSheetByName(confirmationSheetName);
+        if (!confirmationSheet) {
+            appendNotificationLog('半期リマインド', '', hqTo, resolvedBatchId, `確認用シート不在: ${confirmationSheetName}`);
+            return resolvedBatchId;
+        }
+        const confirmationData = confirmationSheet.getDataRange().getValues();
+        const confirmationHeader = confirmationData.length > 0 ? getHeaderMap(confirmationData[0]) : {};
+        const counts = summarizeConfirmationSheetRows(confirmationData, confirmationHeader);
+        if (counts.unchecked <= 0) {
+            return resolvedBatchId;
+        }
+        const batchLabel = getCellValue(row, headerMap['便区分']) || resolvedBatchId;
+        const sheetUrl = buildSheetUrlWithGid(ss, confirmationSheet);
+        const subject = `【リマインド】${batchLabel} 回答確認のお願い`;
+        const body = [
+            '本部長・副本部長 各位',
+            '',
+            `${batchLabel} の確認用シートで、未確認行が残っています。`,
+            `batchId: ${resolvedBatchId}`,
+            `回答期限: ${formatDateLabel(deadline, tz)}`,
+            '',
+            `未確認件数: ${counts.unchecked}`,
+            `未回答件数: ${counts.unanswered}`,
+            '',
+            '確認用シート:',
+            sheetUrl,
+            '',
+            '※本メールは「期限前リマインド」の1回送信です。',
+        ].join('\n');
+        try {
+            MailApp.sendEmail({
+                to: hqTo,
+                subject,
+                name: settings.fromName,
+                body,
+            });
+            const now = new Date();
+            row[headerMap['リマインド送信日時'] - 1] = now;
+            row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.REMINDER_SENT;
+            row[headerMap['更新日時'] - 1] = now;
+            notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
+            appendNotificationLog('半期リマインド', '', hqTo, resolvedBatchId, '成功');
+        }
+        catch (err) {
+            appendNotificationLog('半期リマインド', '', hqTo, resolvedBatchId, `失敗: ${err}`);
+            throw err;
+        }
+        return resolvedBatchId;
+    }
+    finally {
+        lock.releaseLock();
+    }
+}
+function sendSenmuApprovalRequestIfReady(batchId) {
+    const lock = LockService.getDocumentLock();
+    lock.waitLock(30000);
+    try {
+        const settings = loadSettings();
+        const batchContext = getNotifyBatchContext(batchId);
+        if (!batchContext)
+            return '';
+        const { ss, notifyBatchSheet, batchData, headerMap, row } = batchContext;
+        const resolvedBatchId = batchContext.batchId;
+        const tz = ss.getSpreadsheetTimeZone();
+        const senmuTo = String(settings.senmuTo || '').trim();
+        const sentAt = parseDateValue(getCellRaw(row, headerMap['専務依頼送信日時']));
+        if (sentAt)
+            return resolvedBatchId;
+        const confirmationSheetName = getCellValue(row, headerMap['確認用シート名']);
+        if (!confirmationSheetName) {
+            appendNotificationLog('専務依頼', '', '', resolvedBatchId, '確認用シート未設定のためスキップ');
+            return resolvedBatchId;
+        }
+        const confirmationSheet = ss.getSheetByName(confirmationSheetName);
+        if (!confirmationSheet) {
+            appendNotificationLog('専務依頼', '', '', resolvedBatchId, `確認用シート不在: ${confirmationSheetName}`);
+            return resolvedBatchId;
+        }
+        const confirmationData = confirmationSheet.getDataRange().getValues();
+        const confirmationHeader = confirmationData.length > 0 ? getHeaderMap(confirmationData[0]) : {};
+        const counts = summarizeConfirmationSheetRows(confirmationData, confirmationHeader);
+        if (counts.total <= 0)
+            return resolvedBatchId;
+        if (counts.unchecked > 0) {
+            appendNotificationLog('専務依頼', '', '', resolvedBatchId, `未確認行あり(${counts.unchecked}件)のため未送信`);
+            return resolvedBatchId;
+        }
+        if (counts.unanswered > 0) {
+            appendNotificationLog('専務依頼', '', '', resolvedBatchId, `未回答行あり(${counts.unanswered}件)のため未送信`);
+            return resolvedBatchId;
+        }
+        if (!settings.mailSendEnabled) {
+            appendNotificationLog('専務依頼', '', '', resolvedBatchId, '通知_メール送信=FALSE のため送信をスキップ');
+            return resolvedBatchId;
+        }
+        if (!senmuTo) {
+            appendNotificationLog('専務依頼', '', '', resolvedBatchId, '専務_通知先Toが未設定');
+            uiAlertSafe('設定「専務_通知先To」が未設定のため送信できません。');
+            return resolvedBatchId;
+        }
+        const batchLabel = getCellValue(row, headerMap['便区分']) || resolvedBatchId;
+        const deadline = parseDateValue(getCellRaw(row, headerMap['回答期限']));
+        const sheetUrl = buildSheetUrlWithGid(ss, confirmationSheet);
+        const subject = `【専務確認依頼】${batchLabel} 車両更新方針`;
+        const body = [
+            '専務',
+            '',
+            `${batchLabel} の一次確認が完了しました。`,
+            `batchId: ${resolvedBatchId}`,
+            `回答期限: ${formatDateLabel(deadline || new Date(), tz)}`,
+            '',
+            `対象件数: ${counts.total}`,
+            `更新: ${counts.renew}`,
+            `解約（入替）: ${counts.cancellationReplace}`,
+            `解約（満了）: ${counts.cancellationEnd}`,
+            '',
+            '確認用シート（専務判断列を入力してください）:',
+            sheetUrl,
+            '',
+            `専務判断の入力値: ${APPROVAL_INPUT.APPROVE} / ${APPROVAL_INPUT.RETURN}`,
+        ].join('\n');
+        try {
+            MailApp.sendEmail({
+                to: senmuTo,
+                cc: String(settings.senmuCc || ''),
+                subject,
+                name: settings.fromName,
+                body,
+            });
+            const now = new Date();
+            row[headerMap['専務依頼送信日時'] - 1] = now;
+            row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_REQUESTED;
+            row[headerMap['更新日時'] - 1] = now;
+            notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
+            protectSenmuColumns(confirmationSheetName);
+            appendNotificationLog('専務依頼', '', senmuTo, resolvedBatchId, '成功');
+        }
+        catch (err) {
+            appendNotificationLog('専務依頼', '', senmuTo, resolvedBatchId, `失敗: ${err}`);
+            throw err;
+        }
+        return resolvedBatchId;
+    }
+    finally {
+        lock.releaseLock();
+    }
+}
+function applySenmuDecisionFromSheet(batchId) {
+    const lock = LockService.getDocumentLock();
+    lock.waitLock(30000);
+    try {
+        const batchContext = getNotifyBatchContext(batchId);
+        if (!batchContext)
+            return '';
+        const { notifyBatchSheet, batchData, headerMap, row } = batchContext;
+        const resolvedBatchId = batchContext.batchId;
+        const confirmationSheetName = getCellValue(row, headerMap['確認用シート名']);
+        if (!confirmationSheetName) {
+            uiAlertSafe(`確認用シート名が未設定です。\nbatchId: ${resolvedBatchId}`);
+            return resolvedBatchId;
+        }
+        const ss = getSpreadsheet();
+        const sheet = ss.getSheetByName(confirmationSheetName);
+        if (!sheet) {
+            uiAlertSafe(`確認用シートが見つかりません。\n${confirmationSheetName}`);
+            return resolvedBatchId;
+        }
+        protectSenmuColumns(confirmationSheetName);
+        const data = sheet.getDataRange().getValues();
+        if (data.length <= 1)
+            return resolvedBatchId;
+        const h = getHeaderMap(data[0]);
+        const decisionIndex = h['専務判断'];
+        if (!decisionIndex)
+            return resolvedBatchId;
+        let approved = 0;
+        let returned = 0;
+        let pending = 0;
+        let invalid = 0;
+        const invalidRows = [];
+        for (let i = 1; i < data.length; i++) {
+            const rowData = data[i];
+            const vehicleId = getCellValue(rowData, h['vehicleId']);
+            if (!vehicleId)
+                continue;
+            const decision = normalizeSenmuDecision(getCellValue(rowData, decisionIndex));
+            if (!decision) {
+                const raw = getCellValue(rowData, decisionIndex);
+                if (raw) {
+                    invalid += 1;
+                    invalidRows.push(`行${i + 1}: ${raw}`);
+                }
+                else {
+                    pending += 1;
+                }
+                continue;
+            }
+            if (decision === APPROVAL_INPUT.APPROVE)
+                approved += 1;
+            if (decision === APPROVAL_INPUT.RETURN)
+                returned += 1;
+        }
+        const now = new Date();
+        if (returned > 0) {
+            row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_RETURNED;
+        }
+        else if (approved > 0 && pending === 0 && invalid === 0) {
+            row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_APPROVED;
+        }
+        else {
+            row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_REQUESTED;
+        }
+        row[headerMap['更新日時'] - 1] = now;
+        notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
+        appendNotificationLog('専務判断反映', '', '', resolvedBatchId, `承認:${approved} 差戻し:${returned} 保留:${pending} 不正:${invalid}`);
+        const lines = [
+            `batchId: ${resolvedBatchId}`,
+            `承認: ${approved}`,
+            `差戻し: ${returned}`,
+            `保留: ${pending}`,
+            `不正入力: ${invalid}`,
+        ];
+        if (invalidRows.length > 0) {
+            lines.push('', '不正入力明細:', ...invalidRows.slice(0, 10));
+        }
+        uiShowModalSafe('専務判断反映', lines.join('\n'));
+        return resolvedBatchId;
+    }
+    finally {
+        lock.releaseLock();
+    }
+}
+function applyMasterUpdates(batchId) {
+    const lock = LockService.getDocumentLock();
+    lock.waitLock(30000);
+    try {
+        const batchContext = getNotifyBatchContext(batchId);
+        if (!batchContext)
+            return '';
+        const { ss, notifyBatchSheet, batchData, headerMap, row } = batchContext;
+        const resolvedBatchId = batchContext.batchId;
+        const tz = ss.getSpreadsheetTimeZone();
+        const confirmationSheetName = getCellValue(row, headerMap['確認用シート名']);
+        if (!confirmationSheetName) {
+            uiAlertSafe(`確認用シート名が未設定です。\nbatchId: ${resolvedBatchId}`);
+            return resolvedBatchId;
+        }
+        const confirmationSheet = ss.getSheetByName(confirmationSheetName);
+        if (!confirmationSheet) {
+            uiAlertSafe(`確認用シートが見つかりません。\n${confirmationSheetName}`);
+            return resolvedBatchId;
+        }
+        const vehicleSheet = ss.getSheetByName(SHEET_NAMES.VEHICLE_VIEW);
+        if (!vehicleSheet)
+            throw new Error('車両（統合ビュー）が存在しません');
+        const confirmationData = confirmationSheet.getDataRange().getValues();
+        if (confirmationData.length <= 1)
+            return resolvedBatchId;
+        const ch = getHeaderMap(confirmationData[0]);
+        const vehicleData = vehicleSheet.getDataRange().getValues();
+        if (vehicleData.length <= 1)
+            return resolvedBatchId;
+        const vh = getHeaderMap(vehicleData[0]);
+        const vehicleRowIndexById = {};
+        for (let i = 1; i < vehicleData.length; i++) {
+            const vehicleId = getCellValue(vehicleData[i], vh['vehicleId']);
+            if (!vehicleId)
+                continue;
+            vehicleRowIndexById[vehicleId] = i;
+        }
+        const now = new Date();
+        const rowIndexesToGray = [];
+        let applied = 0;
+        let skipped = 0;
+        let waiting = 0;
+        let returned = 0;
+        let modifiedVehicle = false;
+        let modifiedConfirmation = false;
+        for (let i = 1; i < confirmationData.length; i++) {
+            const cRow = confirmationData[i];
+            const vehicleId = getCellValue(cRow, ch['vehicleId']);
+            if (!vehicleId)
+                continue;
+            const decision = normalizeSenmuDecision(getCellValue(cRow, ch['専務判断']));
+            if (decision === APPROVAL_INPUT.RETURN) {
+                returned += 1;
+                continue;
+            }
+            if (decision !== APPROVAL_INPUT.APPROVE) {
+                waiting += 1;
+                continue;
+            }
+            if (isCheckedCell(getCellRaw(cRow, ch['マスター反映済み'])))
+                continue;
+            const policy = normalizeAnswerLabel(getCellValue(cRow, ch['本部回答']));
+            if (!policy) {
+                skipped += 1;
+                continue;
+            }
+            const vehicleRowIndex = vehicleRowIndexById[vehicleId];
+            if (vehicleRowIndex === undefined) {
+                skipped += 1;
+                continue;
+            }
+            const vehicleRow = vehicleData[vehicleRowIndex];
+            const setVehicle = (headerName, value) => {
+                const idx = vh[headerName];
+                if (idx)
+                    vehicleRow[idx - 1] = value;
+            };
+            if (policy === ANSWER_LABELS.RENEW) {
+                const newStart = parseDateValue(getCellRaw(cRow, ch['新契約開始日']));
+                const newEnd = parseDateValue(getCellRaw(cRow, ch['新契約満了日']));
+                if (!newStart || !newEnd) {
+                    skipped += 1;
+                    continue;
+                }
+                setVehicle('契約開始日', toDateOnly(newStart, tz));
+                setVehicle('契約満了日', toDateOnly(newEnd, tz));
+                setVehicle('更新方針', policy);
+                setVehicle('一次回答', policy);
+                setVehicle('最終決定', policy);
+                setVehicle('完了フラグ', true);
+                setVehicle('完了日', now);
+                setVehicle('完了メモ', '半期バッチで更新反映');
+            }
+            else {
+                const cancelDone = isCheckedCell(getCellRaw(cRow, ch['解約完了']));
+                if (!cancelDone) {
+                    skipped += 1;
+                    continue;
+                }
+                setVehicle('更新方針', policy);
+                setVehicle('一次回答', policy);
+                setVehicle('最終決定', policy);
+                setVehicle('完了フラグ', true);
+                setVehicle('完了日', now);
+                setVehicle('完了メモ', '半期バッチで解約反映');
+                rowIndexesToGray.push(vehicleRowIndex + 1);
+            }
+            if (ch['マスター反映済み'])
+                cRow[ch['マスター反映済み'] - 1] = true;
+            if (ch['反映日時'])
+                cRow[ch['反映日時'] - 1] = now;
+            applied += 1;
+            modifiedVehicle = true;
+            modifiedConfirmation = true;
+        }
+        if (modifiedVehicle) {
+            vehicleSheet.getRange(1, 1, vehicleData.length, vehicleData[0].length).setValues(vehicleData);
+            rowIndexesToGray.forEach((rowIndex) => {
+                vehicleSheet.getRange(rowIndex, 1, 1, vehicleData[0].length).setBackground('#d9d9d9');
+            });
+        }
+        if (modifiedConfirmation) {
+            confirmationSheet.getRange(1, 1, confirmationData.length, confirmationData[0].length).setValues(confirmationData);
+        }
+        const counts = summarizeConfirmationSheetRows(confirmationData, ch);
+        if (counts.total > 0 && counts.masterApplied >= counts.total && returned === 0) {
+            row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.COMPLETED;
+        }
+        else if (returned > 0) {
+            row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_RETURNED;
+        }
+        else {
+            row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_APPROVED;
+        }
+        row[headerMap['更新日時'] - 1] = now;
+        notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
+        appendNotificationLog('マスター反映', '', '', resolvedBatchId, `反映:${applied} 待機:${waiting} 差戻し:${returned} スキップ:${skipped}`);
+        uiShowModalSafe('マスター反映', [
+            `batchId: ${resolvedBatchId}`,
+            `反映: ${applied}`,
+            `待機（専務未承認）: ${waiting}`,
+            `差戻し: ${returned}`,
+            `スキップ（入力不足・不整合）: ${skipped}`,
+        ].join('\n'));
+        return resolvedBatchId;
+    }
+    finally {
+        lock.releaseLock();
+    }
+}
 function createRequests() {
+    // 旧導線名の互換。処理単位は半期バッチへ統一する。
+    return createBiannualBatch();
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
     try {
@@ -832,6 +1348,8 @@ function createRequests() {
     }
 }
 function sendInitialEmails() {
+    // 旧導線名の互換。処理単位は半期バッチへ統一する。
+    return sendHqInitialEmail();
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
     try {
@@ -978,6 +1496,8 @@ function sendInitialEmails() {
     }
 }
 function sendReminderEmails() {
+    // 旧導線名の互換。処理単位は半期バッチへ統一する。
+    return sendHqReminderIfNeeded();
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
     try {
@@ -1214,93 +1734,20 @@ function notifyAdminOverdue(params) {
     }
 }
 function doGet(e) {
-    const message = 'このWeb回答ページは廃止されました。通知メール内のGoogleフォームからご回答ください。';
+    const message = 'このWeb回答ページは廃止されました。確認用シートでの入力運用へ移行済みです。';
     return HtmlService.createHtmlOutput(`<p>${escapeHtml(message)}</p>`).setTitle('車両更新回答');
 }
 function doPost(e) {
-    const message = 'このWeb回答ページは廃止されました。通知メール内のGoogleフォームからご回答ください。';
+    const message = 'このWeb回答ページは廃止されました。確認用シートでの入力運用へ移行済みです。';
     return HtmlService.createHtmlOutput(`<p>${escapeHtml(message)}</p>`).setTitle('車両更新回答');
 }
 function onRequestFormSubmit(e) {
-    const lock = LockService.getDocumentLock();
-    lock.waitLock(30000);
-    try {
-        if (!e || !e.response) {
-            Logger.log('onRequestFormSubmit: response がありません');
-            return;
-        }
-        const formId = getFormIdFromEvent(e);
-        if (!formId) {
-            Logger.log('onRequestFormSubmit: formId を取得できません');
-            return;
-        }
-        const requestInfo = findRequestByFormId(formId);
-        if (!requestInfo) {
-            Logger.log(`onRequestFormSubmit: formId に紐づく依頼が見つかりません (${formId})`);
-            return;
-        }
-        const parsed = extractAnswersFromFormResponse(formId, e.response);
-        const vehicleIds = Object.keys(parsed.answersByVehicleId);
-        if (vehicleIds.length === 0) {
-            Logger.log(`onRequestFormSubmit: 回答が空です (${requestInfo.requestId})`);
-            return;
-        }
-        const now = new Date();
-        const answerInputs = vehicleIds.map((vehicleId) => ({
-            requestId: requestInfo.requestId,
-            vehicleId,
-            answer: normalizeAnswerLabel(parsed.answersByVehicleId[vehicleId]),
-            comment: '',
-            responder: '',
-            answeredAt: now,
-        }));
-        upsertAnswers(answerInputs);
-        applyAnswers();
-        const status = updateRequestStatus(requestInfo.requestId);
-        buildSummarySheet();
-        if (status === REQUEST_STATUS.COMPLETED) {
-            closeRequestForms(requestInfo.requestId);
-        }
-    }
-    finally {
-        lock.releaseLock();
-    }
+    // 半期一括フローではフォーム回答を使わないため、旧トリガーは無効化する。
+    Logger.log('onRequestFormSubmit: 旧フォーム導線は廃止済みのため処理をスキップ');
 }
 function onApprovalFormSubmit(e) {
-    const lock = LockService.getDocumentLock();
-    lock.waitLock(30000);
-    try {
-        if (!e || !e.response) {
-            Logger.log('onApprovalFormSubmit: response がありません');
-            return;
-        }
-        const formId = getFormIdFromEvent(e);
-        if (!formId) {
-            Logger.log('onApprovalFormSubmit: formId を取得できません');
-            return;
-        }
-        const requestInfo = findRequestByApprovalFormId(formId);
-        if (!requestInfo || !requestInfo.requestId) {
-            Logger.log(`onApprovalFormSubmit: formId に紐づく依頼が見つかりません (${formId})`);
-            return;
-        }
-        const parsed = extractApprovalDecisionFromFormResponse(e.response);
-        if (!parsed.decision) {
-            Logger.log(`onApprovalFormSubmit: 承認判断が空です (${requestInfo.requestId})`);
-            return;
-        }
-        buildApprovalQueueSheetInternal();
-        writeApprovalDecisionToQueue({
-            requestId: requestInfo.requestId,
-            decision: parsed.decision,
-            comment: parsed.comment,
-        });
-    }
-    finally {
-        lock.releaseLock();
-    }
-    // 実際の状態更新・通知送信は既存ロジックで一元処理する
-    applyApprovalDecisions();
+    // 半期一括フローでは承認フォームを使わないため、旧トリガーは無効化する。
+    Logger.log('onApprovalFormSubmit: 旧承認フォーム導線は廃止済みのため処理をスキップ');
 }
 function extractApprovalDecisionFromFormResponse(response) {
     const result = {
@@ -1345,6 +1792,8 @@ function writeApprovalDecisionToQueue(input) {
     }
 }
 function applyAnswers() {
+    // 旧導線名の互換。処理単位は半期バッチへ統一する。
+    return applyMasterUpdates();
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
     try {
@@ -1691,6 +2140,8 @@ function buildApprovalQueueSheetInternal() {
     writeSheetData(SHEET_NAMES.APPROVAL_QUEUE, rows);
 }
 function sendApprovalRequestEmails() {
+    // 旧導線名の互換。処理単位は半期バッチへ統一する。
+    return sendSenmuApprovalRequestIfReady();
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
     try {
@@ -1824,6 +2275,8 @@ function sendApprovalRequestEmails() {
     }
 }
 function applyApprovalDecisions() {
+    // 旧導線名の互換。処理単位は半期バッチへ統一する。
+    return applySenmuDecisionFromSheet();
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
     try {
@@ -2149,15 +2602,16 @@ function ensureFormSubmitTrigger(form) {
     ScriptApp.newTrigger('onRequestFormSubmit').forForm(form).onFormSubmit().create();
 }
 function runDaily() {
+    // 旧関数名を残しつつ、実行内容は半期バッチ導線へ切り替える。
+    runBiannualSchedule();
+}
+function runBiannualSchedule() {
     syncSchema();
     syncVehicles();
-    createRequests();
-    sendInitialEmails();
-    sendReminderEmails();
-    buildSummarySheet();
-    sendSummaryEmail();
-    buildApprovalQueueSheet();
-    sendApprovalRequestEmails();
+    createBiannualBatch();
+    sendHqInitialEmail();
+    sendHqReminderIfNeeded();
+    sendSenmuApprovalRequestIfReady();
 }
 function seedSettings() {
     const ss = getSpreadsheet();
@@ -2626,155 +3080,46 @@ function cleanupTestData() {
     }
 }
 function runTestSuite() {
-    const lock = LockService.getDocumentLock();
-    lock.waitLock(30000);
-    try {
-        clearTestResults();
-        appendTestResult('開始', 'OK', new Date().toISOString());
-        syncSchema();
-        appendTestResult('syncSchema', 'OK', '');
-        generateDeptTokens();
-        appendTestResult('generateDeptTokens', 'OK', '空欄のみ生成');
-        const diag = diagnoseSourceSheets();
-        if (!diag.every((r) => r.ok)) {
-            appendTestResult('中断', 'NG', 'ソースシートの必須ヘッダが不足しています');
-            return;
-        }
-        const seed = seedTestVehicles();
-        if (seed && seed.skippedSheets && seed.skippedSheets.length > 0) {
-            appendTestResult('seedTestVehicles', 'NG', JSON.stringify(seed));
-            appendTestResult('中断', 'NG', 'テスト車両を投入できないシートがあります');
-            return;
-        }
-        appendTestResult('seedTestVehicles', 'OK', seed ? JSON.stringify(seed) : '');
-        syncVehicles();
-        appendTestResult('syncVehicles', 'OK', '');
-        // 期待値チェック（再実行でもOKな形）
-        const ss = getSpreadsheet();
-        const tz = ss.getSpreadsheetTimeZone();
-        const settings = loadSettings();
-        const deptMaster = loadDeptMaster();
-        const validDept = pickFirstActiveDept(deptMaster);
-        const vehicleSheet = ss.getSheetByName(SHEET_NAMES.VEHICLE_VIEW);
-        if (vehicleSheet) {
-            const data = vehicleSheet.getDataRange().getValues();
-            const header = data.length > 0 ? getHeaderMap(data[0]) : {};
-            const idx = {
-                regCombined: header['登録番号_結合'],
-                dept: header['管理部門'],
-                contractEnd: header['契約満了日'],
-                requestId: header['依頼ID'],
-            };
-            const startDate = toDateOnly(new Date(), tz);
-            const endDate = addMonthsClamped(startDate, settings.expiryMonths);
-            let testTotal = 0;
-            let testInRange = 0;
-            let testInRangeWithRequestId = 0;
-            for (let i = 1; i < data.length; i++) {
-                const row = data[i];
-                const reg = getCellValue(row, idx.regCombined);
-                if (!reg || !reg.startsWith('TEST'))
-                    continue;
-                testTotal += 1;
-                const dept = getCellValue(row, idx.dept);
-                const contractEnd = parseDateValue(getCellRaw(row, idx.contractEnd));
-                const contractDate = contractEnd ? toDateOnly(contractEnd, tz) : null;
-                if (dept === validDept && contractDate && isWithinRange(contractDate, startDate, endDate)) {
-                    testInRange += 1;
-                    if (getCellValue(row, idx.requestId))
-                        testInRangeWithRequestId += 1;
-                }
-            }
-            appendTestResult('期待値:統合ビュー_テスト車両件数', testTotal >= 3 ? 'OK' : 'NG', String(testTotal));
-            appendTestResult('期待値:統合ビュー_期限内車両件数', testInRange >= SOURCE_SHEETS.length ? 'OK' : 'NG', `dept=${validDept || '(empty)'} count=${testInRange}`);
-            // createRequests 前なので依頼IDは「付いていても付いていなくても」OK（再実行想定）
-            appendTestResult('期待値:統合ビュー_期限内_依頼ID付与済(参考)', testInRangeWithRequestId <= testInRange ? 'OK' : 'NG', `${testInRangeWithRequestId}/${testInRange}台`);
-        }
-        const needsInputSheet = ss.getSheetByName(SHEET_NAMES.NEEDS_INPUT);
-        if (needsInputSheet) {
-            const data = needsInputSheet.getDataRange().getValues();
-            const header = data.length > 0 ? getHeaderMap(data[0]) : {};
-            const idx = { reason: header['不備内容'], reg: header['登録番号_結合'] };
-            const counts = {
-                契約満了日なし: 0,
-                管理部門なし: 0,
-                部署マスタ未登録: 0,
-            };
-            for (let i = 1; i < data.length; i++) {
-                const row = data[i];
-                const reg = getCellValue(row, idx.reg);
-                // テスト車両は登録番号_結合が "TEST..." になる
-                if (reg && !reg.startsWith('TEST'))
-                    continue;
-                const reason = getCellValue(row, idx.reason);
-                if (counts[reason] !== undefined)
-                    counts[reason] += 1;
-            }
-            Object.keys(counts).forEach((key) => {
-                appendTestResult(`期待値:要入力_${key}`, counts[key] >= 1 ? 'OK' : 'NG', String(counts[key]));
-            });
-        }
-        const requestSheet = ss.getSheetByName(SHEET_NAMES.REQUESTS);
-        const beforeRequestLastRow = requestSheet ? requestSheet.getLastRow() : 0;
-        createRequests();
-        const afterRequestLastRow = requestSheet ? requestSheet.getLastRow() : 0;
-        appendTestResult('createRequests', 'OK', `newRows=${Math.max(0, afterRequestLastRow - beforeRequestLastRow)}`);
-        // 期待値: createRequests は同じ入力に対して増え続けない（重複防止）
-        const beforeSecondLastRow = requestSheet ? requestSheet.getLastRow() : 0;
-        createRequests();
-        const afterSecondLastRow = requestSheet ? requestSheet.getLastRow() : 0;
-        appendTestResult('期待値:createRequests_重複防止', afterSecondLastRow === beforeSecondLastRow ? 'OK' : 'NG', `newRows=${Math.max(0, afterSecondLastRow - beforeSecondLastRow)}`);
-        // 期待値: 期限内テスト車両へ依頼IDが付与され、依頼シートに管理部門行が存在する
-        if (vehicleSheet) {
-            const data = vehicleSheet.getDataRange().getValues();
-            const header = data.length > 0 ? getHeaderMap(data[0]) : {};
-            const idx = {
-                regCombined: header['登録番号_結合'],
-                dept: header['管理部門'],
-                contractEnd: header['契約満了日'],
-                requestId: header['依頼ID'],
-            };
-            const startDate = toDateOnly(new Date(), tz);
-            const endDate = addMonthsClamped(startDate, settings.expiryMonths);
-            let testInRange = 0;
-            let testInRangeWithRequestId = 0;
-            for (let i = 1; i < data.length; i++) {
-                const row = data[i];
-                const reg = getCellValue(row, idx.regCombined);
-                if (!reg || !reg.startsWith('TEST'))
-                    continue;
-                const dept = getCellValue(row, idx.dept);
-                const contractEnd = parseDateValue(getCellRaw(row, idx.contractEnd));
-                const contractDate = contractEnd ? toDateOnly(contractEnd, tz) : null;
-                if (dept === validDept && contractDate && isWithinRange(contractDate, startDate, endDate)) {
-                    testInRange += 1;
-                    if (getCellValue(row, idx.requestId))
-                        testInRangeWithRequestId += 1;
-                }
-            }
-            appendTestResult('期待値:createRequests_期限内_依頼ID付与', testInRange > 0 && testInRangeWithRequestId === testInRange ? 'OK' : 'NG', `${testInRangeWithRequestId}/${testInRange}台`);
-        }
-        if (requestSheet) {
-            const data = requestSheet.getDataRange().getValues();
-            const header = data.length > 0 ? getHeaderMap(data[0]) : {};
-            const idx = { dept: header['管理部門'], requestId: header['requestId'] };
-            let count = 0;
-            for (let i = 1; i < data.length; i++) {
-                const row = data[i];
-                if (!getCellValue(row, idx.requestId))
-                    continue;
-                if (validDept && getCellValue(row, idx.dept) === validDept)
-                    count += 1;
-            }
-            appendTestResult('期待値:createRequests_依頼行(dept)', count >= 1 ? 'OK' : 'NG', `dept=${validDept} count=${count}`);
-        }
-        buildSummarySheet();
-        appendTestResult('buildSummarySheet', 'OK', '');
-        appendTestResult('完了', 'OK', '');
+    clearTestResults();
+    appendTestResult('開始', 'OK', new Date().toISOString());
+    syncSchema();
+    appendTestResult('syncSchema', 'OK', '');
+    syncVehicles();
+    appendTestResult('syncVehicles', 'OK', '');
+    const batchId = createBiannualBatch();
+    appendTestResult('createBiannualBatch', batchId ? 'OK' : 'NG', String(batchId || ''));
+    const builtSheetName = buildConfirmationSheetForLatestBatch();
+    appendTestResult('buildConfirmationSheetForLatestBatch', builtSheetName ? 'OK' : 'NG', builtSheetName || 'シート未生成');
+    const ss = getSpreadsheet();
+    const batchContext = getNotifyBatchContext(batchId || '');
+    if (!batchContext) {
+        appendTestResult('中断', 'NG', '通知バッチが見つかりません');
+        return;
     }
-    finally {
-        lock.releaseLock();
+    const batchRow = batchContext.row;
+    const h = batchContext.headerMap;
+    const reminderCell = getCellRaw(batchRow, h['リマインド送信日時']);
+    sendHqInitialEmail(batchId || batchContext.batchId);
+    const afterInitial = getNotifyBatchContext(batchId || batchContext.batchId);
+    const sentAt = afterInitial ? parseDateValue(getCellRaw(afterInitial.row, afterInitial.headerMap['初回通知送信日時'])) : null;
+    appendTestResult('sendHqInitialEmail', sentAt ? 'OK' : 'NG', sentAt ? '初回通知送信日時が設定されました' : '未設定');
+    sendHqReminderIfNeeded(batchId || batchContext.batchId);
+    const afterReminder = getNotifyBatchContext(batchId || batchContext.batchId);
+    const reminderAfter = afterReminder ? getCellRaw(afterReminder.row, afterReminder.headerMap['リマインド送信日時']) : '';
+    appendTestResult('sendHqReminderIfNeeded', 'OK', reminderAfter ? '送信条件一致で送信済み' : '送信条件未一致のため未送信');
+    const latestContext = getNotifyBatchContext(batchId || batchContext.batchId) || batchContext;
+    const confirmationSheetName = getCellValue(latestContext.row, latestContext.headerMap['確認用シート名']);
+    const confirmationSheet = confirmationSheetName ? ss.getSheetByName(confirmationSheetName) : null;
+    if (confirmationSheet) {
+        const data = confirmationSheet.getDataRange().getValues();
+        const ch = data.length > 0 ? getHeaderMap(data[0]) : {};
+        const counts = summarizeConfirmationSheetRows(data, ch);
+        appendTestResult('期待値:確認用シート生成件数', counts.total >= 0 ? 'OK' : 'NG', `total=${counts.total} unanswered=${counts.unanswered} unchecked=${counts.unchecked}`);
     }
+    else {
+        appendTestResult('期待値:確認用シート生成件数', 'NG', '確認用シート未生成');
+    }
+    appendTestResult('完了', 'OK', '');
 }
 function generateDeptTokens() {
     const lock = LockService.getDocumentLock();
@@ -2817,22 +3162,42 @@ function setWebAppUrl(url) {
     setSettingValue('Web回答URL（デプロイURL）', url);
 }
 function installDailyTriggers() {
+    const settings = loadSettings();
+    const ss = getSpreadsheet();
+    const tz = ss.getSpreadsheetTimeZone();
     const triggers = ScriptApp.getProjectTriggers();
     triggers.forEach((trigger) => {
-        if (trigger.getHandlerFunction() === 'runDaily') {
+        const handler = trigger.getHandlerFunction();
+        if (handler === 'runDaily' || handler === 'runBiannualSchedule') {
             ScriptApp.deleteTrigger(trigger);
         }
     });
-    const hour = 8;
-    const weekdays = [
-        ScriptApp.WeekDay.MONDAY,
-        ScriptApp.WeekDay.TUESDAY,
-        ScriptApp.WeekDay.WEDNESDAY,
-        ScriptApp.WeekDay.THURSDAY,
-        ScriptApp.WeekDay.FRIDAY,
-    ];
-    weekdays.forEach((day) => {
-        ScriptApp.newTrigger('runDaily').timeBased().onWeekDay(day).atHour(hour).create();
+    const now = toDateOnly(new Date(), tz);
+    const years = [now.getFullYear(), now.getFullYear() + 1];
+    const reminderBeforeDays = Math.max(0, toNumber(settings.reminderBeforeDays, 10));
+    const dateKeys = {};
+    const runDates = [];
+    years.forEach((year) => {
+        const marchSendDate = resolveMonthDaySettingDate(settings.marchSendDate, year, 3, 1, tz);
+        const septemberSendDate = resolveMonthDaySettingDate(settings.septemberSendDate, year, 9, 1, tz);
+        const marchDeadline = resolveMonthDaySettingDate(settings.marchDeadline, year, 3, 31, tz);
+        const septemberDeadline = resolveMonthDaySettingDate(settings.septemberDeadline, year, 9, 30, tz);
+        const marchReminder = addDays(marchDeadline, -reminderBeforeDays);
+        const septemberReminder = addDays(septemberDeadline, -reminderBeforeDays);
+        [marchSendDate, septemberSendDate, marchReminder, septemberReminder].forEach((d) => {
+            const date = toDateOnly(d, tz);
+            if (date.getTime() < now.getTime())
+                return;
+            const key = Utilities.formatDate(date, tz, 'yyyy-MM-dd');
+            if (dateKeys[key])
+                return;
+            dateKeys[key] = true;
+            runDates.push(date);
+        });
+    });
+    runDates.forEach((runDate) => {
+        const triggerAt = new Date(runDate.getFullYear(), runDate.getMonth(), runDate.getDate(), 8, 0, 0);
+        ScriptApp.newTrigger('runBiannualSchedule').timeBased().at(triggerAt).create();
     });
 }
 function getSpreadsheet() {
@@ -3130,6 +3495,106 @@ function findNotifyBatchRow(batchData, headerMap, batchId) {
         return { row, rowIndex: i + 1 };
     }
     return null;
+}
+function getNotifyBatchContext(batchId) {
+    const ss = getSpreadsheet();
+    const notifyBatchSheet = ss.getSheetByName(SHEET_NAMES.NOTIFY_BATCH);
+    if (!notifyBatchSheet || notifyBatchSheet.getLastRow() <= 1)
+        return null;
+    ensureHeaders(notifyBatchSheet, 1, getSchemaHeaders(SHEET_NAMES.NOTIFY_BATCH));
+    const batchData = notifyBatchSheet.getDataRange().getValues();
+    if (batchData.length <= 1)
+        return null;
+    const headerMap = getHeaderMap(batchData[0]);
+    const batchIdIndex = headerMap['batchId'];
+    if (!batchIdIndex)
+        return null;
+    let rowInfo = null;
+    if (batchId) {
+        rowInfo = findNotifyBatchRow(batchData, headerMap, batchId);
+    }
+    else {
+        for (let i = batchData.length - 1; i >= 1; i--) {
+            const row = batchData[i];
+            const id = getCellValue(row, batchIdIndex);
+            if (!id)
+                continue;
+            rowInfo = { row, rowIndex: i + 1 };
+            break;
+        }
+    }
+    if (!rowInfo)
+        return null;
+    const resolvedBatchId = getCellValue(rowInfo.row, batchIdIndex);
+    if (!resolvedBatchId)
+        return null;
+    return {
+        ss,
+        notifyBatchSheet,
+        batchData,
+        headerMap,
+        row: rowInfo.row,
+        rowIndex: rowInfo.rowIndex,
+        batchId: resolvedBatchId,
+    };
+}
+function normalizeSenmuDecision(value) {
+    const text = String(value || '').trim();
+    if (text === APPROVAL_INPUT.APPROVE)
+        return APPROVAL_INPUT.APPROVE;
+    if (text === APPROVAL_INPUT.RETURN)
+        return APPROVAL_INPUT.RETURN;
+    if (text === '承認済')
+        return APPROVAL_INPUT.APPROVE;
+    return '';
+}
+function isCheckedCell(value) {
+    if (typeof value === 'boolean')
+        return value;
+    if (value === 1)
+        return true;
+    const text = String(value || '').trim().toLowerCase();
+    return text === 'true' || text === '1' || text === 'yes' || text === '済' || text === '完了';
+}
+function summarizeConfirmationSheetRows(data, headerMap) {
+    const result = {
+        total: 0,
+        unchecked: 0,
+        unanswered: 0,
+        renew: 0,
+        cancellationReplace: 0,
+        cancellationEnd: 0,
+        masterApplied: 0,
+    };
+    if (!data || data.length <= 1)
+        return result;
+    for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        const vehicleId = getCellValue(row, headerMap['vehicleId']);
+        if (!vehicleId)
+            continue;
+        result.total += 1;
+        const answer = normalizeAnswerLabel(getCellValue(row, headerMap['本部回答']));
+        if (!answer) {
+            result.unanswered += 1;
+        }
+        else if (answer === ANSWER_LABELS.RENEW) {
+            result.renew += 1;
+        }
+        else if (answer === ANSWER_LABELS.CANCELLATION_REPLACE) {
+            result.cancellationReplace += 1;
+        }
+        else if (answer === ANSWER_LABELS.CANCELLATION_END) {
+            result.cancellationEnd += 1;
+        }
+        if (!isCheckedCell(getCellRaw(row, headerMap['回答確認済み']))) {
+            result.unchecked += 1;
+        }
+        if (isCheckedCell(getCellRaw(row, headerMap['マスター反映済み']))) {
+            result.masterApplied += 1;
+        }
+    }
+    return result;
 }
 function loadVehicleViewContext() {
     const ss = getSpreadsheet();

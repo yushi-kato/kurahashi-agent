@@ -28,6 +28,7 @@
 5. 2026-02-11: 実装レビューで「半期一括案は主要部分が未実装」と確認
 6. 2026-02-11: 不要機能棚卸しと「削除 + 新規実装」を統合した移行計画を作成
 7. 2026-02-11: 移行計画に基づき、フェーズ1（通知バッチ・半期設定キー・確認用シート生成）の実装着手
+8. 2026-02-11: 同計画のフェーズ2〜4（通知/承認/反映導線・半期トリガー・旧導線停止）を実装し、半期一括フローへ切替
 
 ## 3. 現在の読み分け（重要）
 
@@ -38,7 +39,7 @@
 - `docs/plans/plan_vehicle_lease_renewal_hq_biannual_migration_and_rebuild.md`
 
 上記は「どこへ向かうか」の基準です。  
-`docs/reviews/review_vehicle_lease_renewal_hq_biannual_confirmation_implementation.md` の指摘どおり全体移行は未完了だが、最新計画に沿ったフェーズ1実装には着手済みです。
+`docs/reviews/review_vehicle_lease_renewal_hq_biannual_confirmation_implementation.md` は 2026-02-11 午前時点の差分監査として扱い、同日夜の実装で半期一括導線へ切替済みです。
 
 ### 3.2 実装としての最新（現行運用）
 
