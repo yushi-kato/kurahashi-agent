@@ -29,6 +29,7 @@
 6. 2026-02-11: 不要機能棚卸しと「削除 + 新規実装」を統合した移行計画を作成
 7. 2026-02-11: 移行計画に基づき、フェーズ1（通知バッチ・半期設定キー・確認用シート生成）の実装着手
 8. 2026-02-11: 同計画のフェーズ2〜4（通知/承認/反映導線・半期トリガー・旧導線停止）を実装し、半期一括フローへ切替
+9. 2026-02-12: 半期一括フローのE2E手順書（モックデータ準備込み）を追加
 
 ## 3. 現在の読み分け（重要）
 
@@ -72,6 +73,7 @@
 | `docs/guides/sheet_schema_management_rules.md` | スキーマ変更の安全ルール | 共通基盤 | 常時有効 |
 | `docs/guides/development_tips_for_gas.md` | GAS開発の制約と実装上の注意 | 共通基盤 | 常時有効 |
 | `docs/guides/test_automation_vehicle_lease_renewal.md` | テスト実行手順 | 共通基盤 | 常時有効 |
+| `docs/guides/e2e_test_vehicle_lease_renewal_hq_biannual.md` | 半期一括フローのE2E手順（モックデータ準備込み） | 実装基準 | 常時有効 |
 | `docs/plans/plan_vehicle_lease_renewal_gas.md` | 初期実装計画（部署単位） | 現行実装基準 | 有効 |
 | `docs/flows/business_flow_vehicle_lease_renewal.md` | 初期業務フロー（部署単位） | 現行実装基準 | 有効 |
 | `docs/specs/spec_vehicle_lease_renewal_answer_via_google_forms.md` | フォーム回答仕様 | 現行実装基準 | 有効 |
