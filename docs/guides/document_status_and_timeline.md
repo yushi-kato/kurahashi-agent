@@ -32,6 +32,7 @@
 9. 2026-02-12: 半期一括フローのE2E手順書（モックデータ準備込み）を追加
 10. 2026-02-12: 現行運用シートの意味と役割を整理したシート意味一覧を追加
 11. 2026-02-12: 業務/システムのシーケンス図ドキュメントを追加
+12. 2026-02-12: `車両（統合ビュー）` を廃止し、`車両一覧` 正本へ即時一本化（データ移行処理なし）を実装・文書反映
 
 ## 3. 現在の読み分け（重要）
 
@@ -46,14 +47,13 @@
 
 ### 3.2 実装としての最新（現行運用）
 
-- `docs/plans/plan_vehicle_lease_renewal_gas.md`
-- `docs/flows/business_flow_vehicle_lease_renewal.md`
-- `docs/specs/spec_vehicle_lease_renewal_answer_via_google_forms.md`
-- `docs/specs/spec_vehicle_lease_renewal_reminder.md`
 - `docs/operations/operation_manual_vehicle_lease_renewal.md`
+- `docs/guides/e2e_test_vehicle_lease_renewal_hq_biannual.md`
+- `docs/guides/sheet_meanings_vehicle_lease_renewal_hq_biannual.md`
+- `docs/guides/sequence_diagrams_vehicle_lease_renewal_hq_biannual.md`
 
-これらは「いまのコードと運用に近い説明」です。  
-半期一括案に移行完了するまでは、実運用判断で優先して参照します。
+これらは `車両一覧` 正本の現行実装と一致している文書です。  
+旧フォーム系・部署単位の文書は履歴参照として扱います。
 
 ### 3.3 履歴参照（検討経緯）
 
@@ -78,16 +78,16 @@
 | `docs/guides/e2e_test_vehicle_lease_renewal_hq_biannual.md` | 半期一括フローのE2E手順（モックデータ準備込み） | 実装基準 | 常時有効 |
 | `docs/guides/sheet_meanings_vehicle_lease_renewal_hq_biannual.md` | 現行運用シートの意味・役割・更新主体 | 実装基準 | 常時有効 |
 | `docs/guides/sequence_diagrams_vehicle_lease_renewal_hq_biannual.md` | 半期一括フローの業務/システムシーケンス図 | 実装基準 | 常時有効 |
-| `docs/plans/plan_vehicle_lease_renewal_gas.md` | 初期実装計画（部署単位） | 現行実装基準 | 有効 |
-| `docs/flows/business_flow_vehicle_lease_renewal.md` | 初期業務フロー（部署単位） | 現行実装基準 | 有効 |
-| `docs/specs/spec_vehicle_lease_renewal_answer_via_google_forms.md` | フォーム回答仕様 | 現行実装基準 | 有効 |
-| `docs/specs/spec_vehicle_lease_renewal_reminder.md` | リマインド仕様 | 現行実装基準 | 有効 |
-| `docs/operations/operation_manual_vehicle_lease_renewal.md` | 現行運用手順 | 現行実装基準 | 有効（半期一括向け更新は未反映） |
+| `docs/plans/plan_vehicle_lease_renewal_gas.md` | 初期実装計画（部署単位） | 履歴参照 | 背景理解用 |
+| `docs/flows/business_flow_vehicle_lease_renewal.md` | 初期業務フロー（部署単位） | 履歴参照 | 背景理解用 |
+| `docs/specs/spec_vehicle_lease_renewal_answer_via_google_forms.md` | フォーム回答仕様 | 履歴参照 | 背景理解用 |
+| `docs/specs/spec_vehicle_lease_renewal_reminder.md` | リマインド仕様 | 履歴参照 | 背景理解用 |
+| `docs/operations/operation_manual_vehicle_lease_renewal.md` | 現行運用手順 | 実装基準 | 有効（車両一覧一本化を反映済み） |
 | `docs/plans/plan_vehicle_lease_renewal_approval_flow.md` | 承認/差戻し追加案 | 中間検討 | 一部のみ採用、履歴扱い |
 | `docs/briefs/brief_vehicle_lease_renewal_changes_for_inoue.md` | 井上さん向け要点 | 中間検討 | 説明履歴 |
 | `docs/briefs/brief_vehicle_lease_renewal_changes_for_senmu.md` | 専務向け要点 | 中間検討 | 説明履歴 |
 | `docs/plans/plan_vehicle_lease_renewal_hq_biannual_confirmation.md` | 半期一括の確定計画 | 次期要件基準 | 目標として最新 |
-| `docs/plans/plan_vehicle_lease_renewal_hq_biannual_migration_and_rebuild.md` | 半期一括への移行計画（削除 + 新規実装統合） | 次期要件基準 | 実装着手の正本（最新、フェーズ1着手済み） |
+| `docs/plans/plan_vehicle_lease_renewal_hq_biannual_migration_and_rebuild.md` | 半期一括への移行計画（削除 + 新規実装統合） | 次期要件基準 | 実装済み項目の背景参照（車両一覧一本化まで反映済み） |
 | `docs/flows/business_flow_vehicle_lease_renewal_hq_biannual_confirmation.md` | 半期一括の業務定義 | 次期要件基準 | 目標として最新 |
 | `docs/reviews/review_vehicle_lease_renewal_hq_biannual_confirmation_implementation.md` | 実装との差分レビュー | 差分監査 | 2026-02-11時点の実装実態を示す最新 |
 | `docs/reviews/review_obsolete_features_for_hq_biannual_migration.md` | 不要機能の棚卸し（削除候補一覧） | 差分監査 | 移行時の削除範囲を固定する基準 |

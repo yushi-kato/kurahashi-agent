@@ -1,6 +1,7 @@
 # シーケンス図: 車両リース更新通知（半期一括）
 
 - 作成日: 2026-02-12
+- 更新日: 2026-02-12
 - 区分: 実装基準（現行コードの可視化）
 - 対象コード: `/Users/yushi/work/work/クラハシ/src/main.ts`
 - 目的: 「誰がどこを触るか」と「どの処理がどのシートを読み書きするか」を、業務フローとシステムフローの2視点で把握する
@@ -29,7 +30,6 @@ sequenceDiagram
     participant GAS as "GAS（車両更新通知）"
     participant Set as "設定"
     participant List as "車両一覧"
-    participant View as "車両（統合ビュー）"
     participant Need as "要入力"
     participant Batch as "通知バッチ"
     participant Conf as "本部長副本部長確認_YYYYMMDD"
@@ -38,19 +38,22 @@ sequenceDiagram
     Ledger->>List: 元台帳を更新する
     Ops->>Set: 通知先・期限・送信ON/OFFを設定する
 
-    Ops->>GAS: 初期整備として「車両統合ビュー同期」を実行
-    GAS->>List: 台帳を読み取る
-    GAS->>View: 正規化して反映する
+    Ops->>GAS: 初期整備として「車両一覧同期（要入力更新）」を実行
+    GAS->>List: 台帳を読み取り、運用列を補完する
     GAS->>Need: 欠損/不備を出力する
 
     Ops->>GAS: 初回のみ「半期バッチ起票」を実行
-    GAS->>View: 満了日レンジで対象抽出する
+    GAS->>List: 満了日レンジで対象抽出する
     GAS->>Batch: batchを起票する
+
+    Timer->>GAS: 1時間ごとの syncVehicles を起動
+    GAS->>List: 運用列を再補完する
+    GAS->>Need: 不備ログを再生成する
 
     Timer->>GAS: 定期トリガーで自動進行を起動
     GAS->>Batch: 対象batchを確認する
     alt 確認用シート未作成
-        GAS->>View: 対象車両を取得する
+        GAS->>List: 対象車両を取得する
         GAS->>Conf: 確認用シートを作成する
         GAS->>Batch: 確認用シート名を記録する
     end
@@ -82,8 +85,11 @@ sequenceDiagram
     end
 
     Senmu->>Conf: 専務判断/専務コメントを入力する
-
     Murata->>Conf: 新契約日付 または 解約完了を入力する
+
+    Ledger->>GAS: 車両一覧の編集イベントで同期を起動
+    GAS->>List: onEditSourceSync で最小間隔ガード判定
+    GAS->>Need: 条件一致時に要入力を更新
 
     HQ->>GAS: 確認用シート編集イベントで自動進行を起動
     Senmu->>GAS: 確認用シート編集イベントで自動進行を起動
@@ -94,7 +100,7 @@ sequenceDiagram
         GAS->>Log: 専務判断反映結果を記録する
     end
     alt マスター反映が有効かつ条件一致
-        GAS->>View: 承認済みかつ入力完了行を反映する
+        GAS->>List: 承認済みかつ入力完了行を反映する
         GAS->>Conf: 反映済み/反映日時を更新する
         GAS->>Batch: 最終ステータスを更新する
         GAS->>Log: 反映結果を記録する
@@ -120,32 +126,31 @@ sequenceDiagram
     participant FApply as "applyMasterUpdates"
     participant FAuto as "runAutoAdvance"
     participant FEdit as "onEditAutoAdvance"
+    participant FSourceEdit as "onEditSourceSync"
     participant Set as "設定"
     participant List as "車両一覧"
-    participant View as "車両（統合ビュー）"
     participant Need as "要入力"
     participant Batch as "通知バッチ"
     participant Conf as "本部長副本部長確認_YYYYMMDD"
     participant Log as "通知ログ"
 
-    Ops->>Menu: 車両統合ビュー同期
+    Ops->>Menu: 車両一覧同期（要入力更新）
     Menu->>FSync: 実行
-    FSync->>List: READ（元台帳）
-    FSync->>View: READ（既存運用列の引継ぎ）
-    FSync->>View: WRITE（再生成）
+    FSync->>List: READ（元台帳 + 運用列）
+    FSync->>List: WRITE（vehicleId/登録番号_結合/一次回答 補完）
     FSync->>Need: WRITE（不備検出）
 
     Ops->>Menu: 半期バッチ起票
     Menu->>FBatch: 実行
     FBatch->>Set: READ（送付日/期限）
-    FBatch->>View: READ（満了日レンジ抽出）
+    FBatch->>List: READ（満了日レンジ抽出）
     FBatch->>Batch: READ（重複batch確認）
     FBatch->>Batch: WRITE（起票）
 
     Ops->>Menu: 確認用シート生成
     Menu->>FSheet: 実行
     FSheet->>Batch: READ（対象batch）
-    FSheet->>View: READ（対象車両）
+    FSheet->>List: READ（対象車両）
     FSheet->>Conf: WRITE（新規作成/入力ルール）
     FSheet->>Batch: WRITE（確認用シート名/対象件数）
 
@@ -188,8 +193,8 @@ sequenceDiagram
     Menu->>FApply: 実行
     FApply->>Batch: READ（対象batch）
     FApply->>Conf: READ（承認/必須入力）
-    FApply->>View: READ（vehicleId対応）
-    FApply->>View: WRITE（更新反映/解約グレーアウト）
+    FApply->>List: READ（vehicleId対応）
+    FApply->>List: WRITE（更新反映/解約グレーアウト）
     FApply->>Conf: WRITE（反映済み/反映日時）
     FApply->>Batch: WRITE（最終ステータス）
     FApply->>Log: WRITE（反映結果）
@@ -201,6 +206,10 @@ sequenceDiagram
     FAuto->>FSenmu: 全件確認済みなら専務依頼送信
     FEdit->>FDecision: 専務判断反映を自動実行
     FEdit->>FApply: 反映条件を満たす行を自動反映
+
+    Note over FSourceEdit,FSync: 同期漏れ対策
+    FSourceEdit->>FSync: 車両一覧のデータ行編集時に実行（最小間隔ガードあり）
+    FAuto->>FSync: 1時間ごとの定期同期（保険）
 ```
 
 ## 3. 補足（読み方）
