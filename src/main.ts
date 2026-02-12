@@ -41,6 +41,15 @@ const BIANNUAL_BATCH_STATUS = {
   COMPLETED: '反映完了',
 } as const;
 const HQ_CONFIRMATION_SHEET_PREFIX = '本部長副本部長確認_';
+const AUTO_ADVANCE_EDIT_WATCH_HEADERS = [
+  '本部回答',
+  '回答確認済み',
+  '専務判断',
+  '専務コメント',
+  '新契約開始日',
+  '新契約満了日',
+  '解約完了',
+];
 const HQ_CONFIRMATION_HEADERS = [
   'batchId',
   'vehicleId',
@@ -151,6 +160,13 @@ const SETTINGS_DEFAULTS: { [key: string]: string | number | boolean } = {
   回答期限_3月: '03-31',
   回答期限_9月: '09-30',
   リマインド_期限前日数: 10,
+  自動進行_有効: true,
+  自動進行_定期実行_有効: true,
+  自動進行_定期実行_間隔時間: 1,
+  自動進行_編集連動_有効: true,
+  自動進行_専務判断反映_有効: true,
+  自動進行_マスター反映_有効: true,
+  自動進行_最小間隔秒: 30,
 };
 
 const SCHEMA_VERSION = '1';
@@ -158,6 +174,7 @@ const PROP_KEYS = {
   SCHEMA_VERSION: 'SCHEMA_VERSION',
   LAST_SCHEMA_SYNC_AT: 'LAST_SCHEMA_SYNC_AT',
   LAST_SCHEMA_DRIFT_AT: 'LAST_SCHEMA_DRIFT_AT',
+  AUTO_ADVANCE_LAST_RUN_AT: 'AUTO_ADVANCE_LAST_RUN_AT',
 };
 
 function onOpen() {
@@ -175,6 +192,7 @@ function onOpen() {
     .addItem('専務依頼送信（全件確認後）', 'sendSenmuApprovalRequestIfReady')
     .addItem('専務判断反映（最新バッチ）', 'applySenmuDecisionFromSheet')
     .addItem('マスター反映（最新バッチ）', 'applyMasterUpdates')
+    .addItem('自動進行（最新バッチ）', 'runAutoAdvanceNow')
     .addSeparator()
     .addItem('設定ひな形作成', 'seedSettings')
     .addItem('テスト一括実行(メール送信は設定次第)', 'runTestSuite')
@@ -1250,6 +1268,81 @@ function runBiannualSchedule() {
   sendSenmuApprovalRequestIfReady();
 }
 
+function runAutoAdvance() {
+  const settings = loadSettings();
+  if (!settings.autoAdvanceEnabled || !settings.autoAdvanceTimerEnabled) return '';
+  if (!tryReserveAutoAdvanceRun(settings.autoAdvanceMinIntervalSec)) return '';
+  return advanceBiannualWorkflow('', 'timer');
+}
+
+function runAutoAdvanceNow() {
+  const settings = loadSettings();
+  if (!settings.autoAdvanceEnabled) return '';
+  return advanceBiannualWorkflow('', 'manual');
+}
+
+function onEditAutoAdvance(e: GoogleAppsScript.Events.SheetsOnEdit) {
+  const settings = loadSettings();
+  if (!settings.autoAdvanceEnabled || !settings.autoAdvanceOnEditEnabled) return '';
+  if (!e || !e.range) return '';
+
+  const range = e.range;
+  const sheet = range.getSheet();
+  if (!sheet) return '';
+  const sheetName = sheet.getName();
+  if (!isConfirmationSheetName(sheetName)) return '';
+  if (range.getRow() <= 1) return '';
+
+  const lastColumn = sheet.getLastColumn();
+  if (lastColumn <= 0) return '';
+  const headerValues = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  const headerMap = getHeaderMap(headerValues);
+  if (!rangeTouchesHeaders(range, headerMap, AUTO_ADVANCE_EDIT_WATCH_HEADERS)) return '';
+
+  if (!tryReserveAutoAdvanceRun(settings.autoAdvanceMinIntervalSec)) return '';
+  const batchId = resolveBatchIdFromConfirmationEdit(sheet, range.getRow(), headerMap);
+  return advanceBiannualWorkflow(batchId, 'onEdit');
+}
+
+function advanceBiannualWorkflow(batchId?: string, reason?: string) {
+  const settings = loadSettings();
+  if (!settings.autoAdvanceEnabled) return '';
+
+  const context = getNotifyBatchContext(batchId);
+  if (!context) return '';
+  const targetBatchId = context.batchId;
+
+  try {
+    const ctx = getNotifyBatchContext(targetBatchId) || context;
+    const confirmationSheetName = getCellValue(ctx.row, ctx.headerMap['確認用シート名']);
+    if (!confirmationSheetName || !ctx.ss.getSheetByName(confirmationSheetName)) {
+      buildConfirmationSheet(targetBatchId);
+    }
+
+    const afterBuildContext = getNotifyBatchContext(targetBatchId) || ctx;
+    const initialSentAt = parseDateValue(getCellRaw(afterBuildContext.row, afterBuildContext.headerMap['初回通知送信日時']));
+    if (!initialSentAt) {
+      sendHqInitialEmail(targetBatchId);
+    }
+
+    sendHqReminderIfNeeded(targetBatchId);
+    sendSenmuApprovalRequestIfReady(targetBatchId);
+
+    if (settings.autoApplySenmuDecision && shouldRunAutoSenmuDecision(targetBatchId)) {
+      applySenmuDecisionFromSheet(targetBatchId);
+    }
+
+    if (settings.autoApplyMasterUpdates && shouldRunAutoMasterUpdate(targetBatchId)) {
+      applyMasterUpdates(targetBatchId);
+    }
+  } catch (err) {
+    appendNotificationLog('自動進行', '', '', targetBatchId, `失敗(${reason || 'unknown'}): ${err}`);
+    throw err;
+  }
+
+  return targetBatchId;
+}
+
 function seedSettings() {
   const ss = getSpreadsheet();
   const sheet = ensureSheet(ss, SHEET_NAMES.SETTINGS);
@@ -1300,6 +1393,130 @@ function exportTestResults(limit?: number) {
 
 function ping() {
   return { ok: true, at: new Date().toISOString() };
+}
+
+function seedE2EMockVehicles() {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    const ss = getSpreadsheet();
+    const sheet = ss.getSheetByName(PRIMARY_SOURCE_SHEET);
+    if (!sheet) throw new Error(`対象シートが存在しません: ${PRIMARY_SOURCE_SHEET}`);
+
+    const data = sheet.getDataRange().getValues();
+    if (data.length === 0) throw new Error(`${PRIMARY_SOURCE_SHEET} にヘッダ行がありません`);
+
+    const headerMap = getHeaderMap(data[0]);
+    const idx = resolveSourceHeaders(headerMap) as any;
+    const hasRegColumns = !!idx.regAll || !!(idx.regArea && idx.regClass && idx.regKana && idx.regNumber);
+    if (!hasRegColumns || !idx.contractEnd || !idx.dept) {
+      throw new Error('モック投入に必要なヘッダが不足しています（登録番号/契約満了日/管理部門）');
+    }
+
+    const tz = ss.getSpreadsheetTimeZone();
+    const today = toDateOnly(new Date(), tz);
+    const baseStart = addDays(today, -300);
+    const scenarios = [
+      {
+        code: '1001',
+        label: 'TEST_更新対象',
+        chassis: 'TEST-CH-001',
+        dept: '本社総務',
+        manager: 'テスト太郎',
+        contractEnd: today,
+        inspectionEnd: addDays(today, 365),
+        leaseFee: 50000,
+      },
+      {
+        code: '1002',
+        label: 'TEST_解約対象',
+        chassis: 'TEST-CH-002',
+        dept: '本社総務',
+        manager: 'テスト花子',
+        contractEnd: addDays(today, 1),
+        inspectionEnd: addDays(today, 366),
+        leaseFee: 52000,
+      },
+      {
+        code: '9001',
+        label: 'TEST_対象外',
+        chassis: 'TEST-CH-003',
+        dept: '本社総務',
+        manager: 'テスト次郎',
+        contractEnd: addDays(today, 200),
+        inspectionEnd: addDays(today, 560),
+        leaseFee: 53000,
+      },
+      {
+        code: 'ERR1',
+        label: 'TEST_満了日欠損',
+        chassis: 'TEST-CH-004',
+        dept: '本社総務',
+        manager: 'テスト欠損',
+        contractEnd: null as Date | null,
+        inspectionEnd: addDays(today, 430),
+        leaseFee: 54000,
+      },
+    ];
+
+    const existingKeys: { [key: string]: boolean } = {};
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      const regCombined = getSourceRegistrationCombined(row, idx);
+      const chassis = getCellValue(row, idx.chassis);
+      const key = `${regCombined}__${chassis}`;
+      if (regCombined || chassis) existingKeys[key] = true;
+    }
+
+    const rowsToAdd: any[][] = [];
+    let skippedExisting = 0;
+
+    scenarios.forEach((s) => {
+      const regCombined = `TEST-${s.code}`;
+      const key = `${regCombined}__${s.chassis}`;
+      if (existingKeys[key]) {
+        skippedExisting += 1;
+        return;
+      }
+
+      const row = new Array(data[0].length).fill('');
+      if (idx.regAll) {
+        row[idx.regAll - 1] = regCombined;
+      } else {
+        row[idx.regArea - 1] = 'TEST';
+        row[idx.regClass - 1] = '99';
+        row[idx.regKana - 1] = 'テ';
+        row[idx.regNumber - 1] = s.code;
+      }
+
+      if (idx.vehicleType) row[idx.vehicleType - 1] = s.label;
+      if (idx.chassis) row[idx.chassis - 1] = s.chassis;
+      if (idx.contractStart) row[idx.contractStart - 1] = baseStart;
+      if (idx.contractEnd && s.contractEnd) row[idx.contractEnd - 1] = s.contractEnd;
+      if (idx.dept) row[idx.dept - 1] = s.dept;
+      if (idx.manager) row[idx.manager - 1] = s.manager;
+      if (idx.contractTerm) row[idx.contractTerm - 1] = '60ヶ月';
+      if (idx.inspectionEnd) row[idx.inspectionEnd - 1] = s.inspectionEnd;
+      if (idx.leaseFee) row[idx.leaseFee - 1] = s.leaseFee;
+
+      rowsToAdd.push(row);
+      existingKeys[key] = true;
+    });
+
+    if (rowsToAdd.length > 0) {
+      sheet.getRange(sheet.getLastRow() + 1, 1, rowsToAdd.length, data[0].length).setValues(rowsToAdd);
+    }
+
+    const result = {
+      inserted: rowsToAdd.length,
+      skippedExisting,
+      sourceSheet: PRIMARY_SOURCE_SHEET,
+    };
+    uiAlertSafe(`E2Eモック車両を投入しました。\n${JSON.stringify(result)}`);
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function cleanupTestData() {
@@ -1514,10 +1731,11 @@ function installDailyTriggers() {
   const settings = loadSettings();
   const ss = getSpreadsheet();
   const tz = ss.getSpreadsheetTimeZone();
+  const managedHandlers = ['runDaily', 'runBiannualSchedule', 'runAutoAdvance', 'onEditAutoAdvance'];
   const triggers = ScriptApp.getProjectTriggers();
   triggers.forEach((trigger) => {
     const handler = trigger.getHandlerFunction();
-    if (handler === 'runDaily' || handler === 'runBiannualSchedule') {
+    if (managedHandlers.indexOf(handler) >= 0) {
       ScriptApp.deleteTrigger(trigger);
     }
   });
@@ -1550,6 +1768,15 @@ function installDailyTriggers() {
     const triggerAt = new Date(runDate.getFullYear(), runDate.getMonth(), runDate.getDate(), 8, 0, 0);
     ScriptApp.newTrigger('runBiannualSchedule').timeBased().at(triggerAt).create();
   });
+
+  if (settings.autoAdvanceEnabled && settings.autoAdvanceTimerEnabled) {
+    const intervalHours = Math.max(1, Math.min(23, Math.floor(settings.autoAdvanceTimerIntervalHours)));
+    ScriptApp.newTrigger('runAutoAdvance').timeBased().everyHours(intervalHours).create();
+  }
+
+  if (settings.autoAdvanceEnabled && settings.autoAdvanceOnEditEnabled) {
+    ScriptApp.newTrigger('onEditAutoAdvance').forSpreadsheet(ss).onEdit().create();
+  }
 }
 
 // === helpers ===
@@ -1909,6 +2136,114 @@ function getNotifyBatchContext(batchId?: string) {
   };
 }
 
+function shouldRunAutoSenmuDecision(batchId: string) {
+  const context = getNotifyBatchContext(batchId);
+  if (!context) return false;
+  const status = getCellValue(context.row, context.headerMap['ステータス']);
+  if (
+    status !== BIANNUAL_BATCH_STATUS.SENMU_REQUESTED &&
+    status !== BIANNUAL_BATCH_STATUS.SENMU_APPROVED &&
+    status !== BIANNUAL_BATCH_STATUS.SENMU_RETURNED
+  ) {
+    return false;
+  }
+
+  const confirmationSheetName = getCellValue(context.row, context.headerMap['確認用シート名']);
+  if (!confirmationSheetName) return false;
+  const sheet = context.ss.getSheetByName(confirmationSheetName);
+  if (!sheet || sheet.getLastRow() <= 1) return false;
+  const data = sheet.getDataRange().getValues();
+  const headerMap = getHeaderMap(data[0]);
+  const decisionCol = headerMap['専務判断'];
+  if (!decisionCol) return false;
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const vehicleId = getCellValue(row, headerMap['vehicleId']);
+    if (!vehicleId) continue;
+    const decision = normalizeSenmuDecision(getCellValue(row, decisionCol));
+    if (decision) return true;
+  }
+  return false;
+}
+
+function shouldRunAutoMasterUpdate(batchId: string) {
+  const context = getNotifyBatchContext(batchId);
+  if (!context) return false;
+  const status = getCellValue(context.row, context.headerMap['ステータス']);
+  if (status === BIANNUAL_BATCH_STATUS.COMPLETED) return false;
+  return status === BIANNUAL_BATCH_STATUS.SENMU_APPROVED || status === BIANNUAL_BATCH_STATUS.SENMU_RETURNED;
+}
+
+function isConfirmationSheetName(sheetName: string) {
+  return String(sheetName || '').startsWith(HQ_CONFIRMATION_SHEET_PREFIX);
+}
+
+function rangeTouchesHeaders(
+  range: GoogleAppsScript.Spreadsheet.Range,
+  headerMap: { [key: string]: number },
+  headerNames: string[],
+) {
+  const startCol = range.getColumn();
+  const endCol = startCol + range.getNumColumns() - 1;
+  return headerNames.some((name) => {
+    const col = headerMap[name];
+    return !!col && col >= startCol && col <= endCol;
+  });
+}
+
+function resolveBatchIdFromConfirmationEdit(
+  sheet: GoogleAppsScript.Spreadsheet.Sheet,
+  rowIndex: number,
+  headerMap: { [key: string]: number },
+) {
+  const batchIdCol = headerMap['batchId'];
+  if (batchIdCol) {
+    const batchId = String(sheet.getRange(rowIndex, batchIdCol).getValue() || '').trim();
+    if (batchId) return batchId;
+  }
+  return findBatchIdByConfirmationSheetName(sheet.getName());
+}
+
+function findBatchIdByConfirmationSheetName(sheetName: string) {
+  const ss = getSpreadsheet();
+  const notifyBatchSheet = ss.getSheetByName(SHEET_NAMES.NOTIFY_BATCH);
+  if (!notifyBatchSheet || notifyBatchSheet.getLastRow() <= 1) return '';
+
+  const data = notifyBatchSheet.getDataRange().getValues();
+  if (data.length <= 1) return '';
+  const headerMap = getHeaderMap(data[0]);
+  const batchIdIndex = headerMap['batchId'];
+  const confirmationSheetIndex = headerMap['確認用シート名'];
+  if (!batchIdIndex || !confirmationSheetIndex) return '';
+
+  for (let i = data.length - 1; i >= 1; i--) {
+    const row = data[i];
+    if (getCellValue(row, confirmationSheetIndex) !== sheetName) continue;
+    const batchId = getCellValue(row, batchIdIndex);
+    if (batchId) return batchId;
+  }
+  return '';
+}
+
+function tryReserveAutoAdvanceRun(minIntervalSec: number) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(3000)) return false;
+  try {
+    const props = PropertiesService.getDocumentProperties();
+    const now = Date.now();
+    const key = PROP_KEYS.AUTO_ADVANCE_LAST_RUN_AT;
+    const lastRaw = props.getProperty(key);
+    const last = lastRaw ? Number(lastRaw) : 0;
+    const minMillis = Math.max(0, Math.floor(minIntervalSec)) * 1000;
+    if (last > 0 && now - last < minMillis) return false;
+    props.setProperty(key, String(now));
+    return true;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 function normalizeSenmuDecision(value: any) {
   const text = String(value || '').trim();
   if (text === APPROVAL_INPUT.APPROVE) return APPROVAL_INPUT.APPROVE;
@@ -2054,6 +2389,31 @@ function loadSettings() {
     marchDeadline: values['回答期限_3月'] || SETTINGS_DEFAULTS['回答期限_3月'],
     septemberDeadline: values['回答期限_9月'] || SETTINGS_DEFAULTS['回答期限_9月'],
     reminderBeforeDays: toNumber(values['リマインド_期限前日数'], Number(SETTINGS_DEFAULTS['リマインド_期限前日数'])),
+    autoAdvanceEnabled: toBoolean(values['自動進行_有効'], Boolean(SETTINGS_DEFAULTS['自動進行_有効'])),
+    autoAdvanceTimerEnabled: toBoolean(
+      values['自動進行_定期実行_有効'],
+      Boolean(SETTINGS_DEFAULTS['自動進行_定期実行_有効']),
+    ),
+    autoAdvanceTimerIntervalHours: toNumber(
+      values['自動進行_定期実行_間隔時間'],
+      Number(SETTINGS_DEFAULTS['自動進行_定期実行_間隔時間']),
+    ),
+    autoAdvanceOnEditEnabled: toBoolean(
+      values['自動進行_編集連動_有効'],
+      Boolean(SETTINGS_DEFAULTS['自動進行_編集連動_有効']),
+    ),
+    autoApplySenmuDecision: toBoolean(
+      values['自動進行_専務判断反映_有効'],
+      Boolean(SETTINGS_DEFAULTS['自動進行_専務判断反映_有効']),
+    ),
+    autoApplyMasterUpdates: toBoolean(
+      values['自動進行_マスター反映_有効'],
+      Boolean(SETTINGS_DEFAULTS['自動進行_マスター反映_有効']),
+    ),
+    autoAdvanceMinIntervalSec: toNumber(
+      values['自動進行_最小間隔秒'],
+      Number(SETTINGS_DEFAULTS['自動進行_最小間隔秒']),
+    ),
   };
 }
 
