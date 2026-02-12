@@ -167,25 +167,32 @@ function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('車両更新通知')
     .addItem('運用マニュアル（このシートで見る）', 'showOperationManual')
-    .addItem('スキーマ同期', 'syncSchema')
-    .addItem('スキーマドリフト確認', 'checkSchemaDrift')
-    .addSeparator()
-    .addItem('車両一覧同期（要入力更新）', 'syncVehicles')
-    .addItem('半期バッチ起票', 'createBiannualBatch')
-    .addItem('確認用シート生成（最新バッチ）', 'buildConfirmationSheetForLatestBatch')
-    .addItem('初回通知送信（最新バッチ）', 'sendHqInitialEmail')
-    .addItem('リマインド送信（条件一致時）', 'sendHqReminderIfNeeded')
-    .addItem('専務依頼送信（全件確認後）', 'sendSenmuApprovalRequestIfReady')
-    .addItem('専務判断反映（最新バッチ）', 'applySenmuDecisionFromSheet')
-    .addItem('マスター反映（最新バッチ）', 'applyMasterUpdates')
-    .addItem('自動進行（最新バッチ）', 'runAutoAdvanceNow')
-    .addSeparator()
-    .addItem('設定ひな形作成', 'seedSettings')
-    .addItem('テスト一括実行(メール送信は設定次第)', 'runTestSuite')
-    .addItem('テストデータ掃除', 'cleanupTestData')
-    .addItem('半期トリガー再作成', 'installDailyTriggers')
-    .addSeparator()
     .addItem('半期一括実行', 'runDaily')
+    .addSeparator()
+    .addSubMenu(
+      ui.createMenu('手動ステップ')
+        .addItem('車両一覧同期（要入力更新）', 'syncVehicles')
+        .addItem('半期バッチ起票', 'createBiannualBatch')
+        .addItem('確認用シート生成（最新バッチ）', 'buildConfirmationSheetForLatestBatch')
+        .addItem('初回通知送信（最新バッチ）', 'sendHqInitialEmail')
+        .addItem('リマインド送信（条件一致時）', 'sendHqReminderIfNeeded')
+        .addItem('専務依頼送信（全件確認後）', 'sendSenmuApprovalRequestIfReady')
+        .addItem('専務判断反映（最新バッチ）', 'applySenmuDecisionFromSheet')
+        .addItem('マスター反映（最新バッチ）', 'applyMasterUpdates')
+        .addItem('自動進行（最新バッチ）', 'runAutoAdvanceNow'),
+    )
+    .addSubMenu(
+      ui.createMenu('管理・設定')
+        .addItem('スキーマ同期', 'syncSchema')
+        .addItem('スキーマドリフト確認', 'checkSchemaDrift')
+        .addItem('設定ひな形作成', 'seedSettings')
+        .addItem('半期トリガー再作成', 'installDailyTriggers'),
+    )
+    .addSubMenu(
+      ui.createMenu('テスト・保守')
+        .addItem('テスト一括実行(メール送信は設定次第)', 'runTestSuite')
+        .addItem('テストデータ掃除', 'cleanupTestData'),
+    )
     .addToUi();
 }
 
