@@ -7,10 +7,6 @@ const manualInputCandidates = [
   path.join(repoRoot, 'docs', 'operations', 'operation_manual_vehicle_lease_renewal.md'),
   path.join(repoRoot, 'docs', 'operation_manual_vehicle_lease_renewal.md'),
 ];
-const overviewInputCandidates = [
-  path.join(repoRoot, 'docs', 'operations', 'operation_overview_vehicle_lease_renewal.md'),
-  path.join(repoRoot, 'docs', 'operation_overview_vehicle_lease_renewal.md'),
-];
 const outputPath = path.join(repoRoot, 'dist', 'operation_manual_vehicle_lease_renewal.html');
 
 function resolveExistingPath(candidates, label) {
@@ -19,35 +15,6 @@ function resolveExistingPath(candidates, label) {
     throw new Error(`${label}が見つかりません: ${candidates.join(', ')}`);
   }
   return found;
-}
-
-function findExistingPath(candidates) {
-  return candidates.find((candidate) => fs.existsSync(candidate)) || '';
-}
-
-function removeFirstLevelHeading(md) {
-  return String(md).replace(/^#\s+.+\n+/, '');
-}
-
-function buildCombinedMarkdown(manualMd, overviewMd) {
-  const normalizedManual = String(manualMd).replace(
-    /まずは「\[業務フロー概要\]\(\.\/operation_overview_vehicle_lease_renewal\.md\)」をご覧ください。\s*/u,
-    'まずは本ページ内の「業務フロー概要（図解）」をご覧ください。\n',
-  );
-
-  if (!overviewMd) return normalizedManual;
-
-  const overviewBody = removeFirstLevelHeading(overviewMd).trim();
-  if (!overviewBody) return normalizedManual;
-
-  return `${normalizedManual.trim()}
-
----
-
-## 業務フロー概要（図解）
-
-${overviewBody}
-`;
 }
 
 function escapeHtml(text) {
@@ -334,11 +301,8 @@ ${bodyHtml}
 
 fs.mkdirSync(path.dirname(outputPath), { recursive: true });
 const manualInputPath = resolveExistingPath(manualInputCandidates, '運用マニュアルMarkdown');
-const overviewInputPath = findExistingPath(overviewInputCandidates);
 const manualMd = fs.readFileSync(manualInputPath, 'utf8');
-const overviewMd = overviewInputPath ? fs.readFileSync(overviewInputPath, 'utf8') : '';
-const mergedMd = buildCombinedMarkdown(manualMd, overviewMd);
-const bodyHtml = markdownToHtml(mergedMd);
+const bodyHtml = markdownToHtml(manualMd);
 const doc = buildHtmlDocument(bodyHtml);
 fs.writeFileSync(outputPath, doc, 'utf8');
 console.log(`generated: ${path.relative(repoRoot, outputPath)}`);
