@@ -299,10 +299,28 @@ ${bodyHtml}
 `;
 }
 
-fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-const manualInputPath = resolveExistingPath(manualInputCandidates, '運用マニュアルMarkdown');
-const manualMd = fs.readFileSync(manualInputPath, 'utf8');
-const bodyHtml = markdownToHtml(manualMd);
-const doc = buildHtmlDocument(bodyHtml);
-fs.writeFileSync(outputPath, doc, 'utf8');
-console.log(`generated: ${path.relative(repoRoot, outputPath)}`);
+const targets = [
+  {
+    label: '運用マニュアル',
+    inputs: [
+      path.join(repoRoot, 'docs', 'operations', 'operation_manual_vehicle_lease_renewal.md'),
+      path.join(repoRoot, 'docs', 'operation_manual_vehicle_lease_renewal.md'),
+    ],
+    output: path.join(repoRoot, 'dist', 'operation_manual_vehicle_lease_renewal.html'),
+  },
+  {
+    label: 'テスト手順書',
+    inputs: [path.join(repoRoot, 'docs', 'operations', 'test_guide.md')],
+    output: path.join(repoRoot, 'dist', 'test_guide.html'),
+  },
+];
+
+for (const target of targets) {
+  fs.mkdirSync(path.dirname(target.output), { recursive: true });
+  const inputPath = resolveExistingPath(target.inputs, `${target.label}Markdown`);
+  const md = fs.readFileSync(inputPath, 'utf8');
+  const body = markdownToHtml(md);
+  const doc = buildHtmlDocument(body);
+  fs.writeFileSync(target.output, doc, 'utf8');
+  console.log(`generated: ${path.relative(repoRoot, target.output)}`);
+}
