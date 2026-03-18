@@ -1013,6 +1013,10 @@ function sendHqReturnNotification(batchId) {
                 cRow[ch['専務判断'] - 1] = '';
             if (ch['専務コメント'])
                 cRow[ch['専務コメント'] - 1] = '';
+            if (ch['村田主任確認済み'])
+                cRow[ch['村田主任確認済み'] - 1] = '';
+            if (ch['反映日時'])
+                cRow[ch['反映日時'] - 1] = '';
             modified = true;
         }
         if (modified) {
