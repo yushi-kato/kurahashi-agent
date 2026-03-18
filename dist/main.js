@@ -43,6 +43,7 @@ const AUTO_ADVANCE_EDIT_WATCH_HEADERS = [
     '新契約開始日',
     '新契約満了日',
     '解約完了',
+    '村田主任確認済み',
 ];
 const HQ_CONFIRMATION_HEADERS = [
     'batchId',
@@ -64,7 +65,7 @@ const HQ_CONFIRMATION_HEADERS = [
     '新契約開始日',
     '新契約満了日',
     '解約完了',
-    'マスター反映済み',
+    '村田主任確認済み',
     '反映日時',
 ];
 const VIEW_SHEET_PROTECTION_DESC_PREFIX = 'managed_by_script:view_sheet:';
@@ -145,6 +146,7 @@ const SETTINGS_DEFAULTS = {
     自動進行_専務判断反映_有効: true,
     自動進行_マスター反映_有効: true,
     自動進行_最小間隔秒: 30,
+    最終承認者アカウント: '',
 };
 const SCHEMA_VERSION = '1';
 const PROP_KEYS = {
@@ -497,7 +499,7 @@ function buildConfirmationSheet(batchId) {
     writeArbitrarySheetData(sheet, HQ_CONFIRMATION_HEADERS, rows);
     const headerMap = getHeaderMap(HQ_CONFIRMATION_HEADERS);
     if (rows.length > 0) {
-        const checkColumns = ['回答確認済み', '解約完了', 'マスター反映済み'];
+        const checkColumns = ['回答確認済み', '解約完了', '村田主任確認済み'];
         checkColumns.forEach((name) => {
             const col = headerMap[name];
             if (!col)
@@ -936,6 +938,7 @@ function applyMasterUpdates(batchId) {
         let returned = 0;
         let modifiedVehicle = false;
         let modifiedConfirmation = false;
+        const allErrors = [];
         for (let i = 1; i < confirmationData.length; i++) {
             const cRow = confirmationData[i];
             const vehicleId = getCellValue(cRow, ch['vehicleId']);
@@ -946,14 +949,44 @@ function applyMasterUpdates(batchId) {
                 returned += 1;
                 continue;
             }
-            if (decision !== APPROVAL_INPUT.APPROVE) {
-                waiting += 1;
+            // 村田主任確認済みがチェックされていなければスキップ
+            if (!isCheckedCell(getCellRaw(cRow, ch['村田主任確認済み']))) {
+                if (decision !== APPROVAL_INPUT.APPROVE) {
+                    waiting += 1;
+                }
+                else {
+                    skipped += 1;
+                }
                 continue;
             }
-            if (isCheckedCell(getCellRaw(cRow, ch['マスター反映済み'])))
+            // 二重反映防止
+            if (getCellValue(cRow, ch['反映日時']))
                 continue;
+            // バリデーション
+            const errors = [];
+            const vehicleLabel = getCellValue(cRow, ch['登録番号']) || vehicleId;
+            if (decision !== APPROVAL_INPUT.APPROVE) {
+                errors.push(`${vehicleLabel}: 専務判断が「承認」ではありません`);
+            }
             const policy = normalizeAnswerLabel(getCellValue(cRow, ch['本部回答']));
             if (!policy) {
+                errors.push(`${vehicleLabel}: 本部回答が未入力です`);
+            }
+            if (policy === ANSWER_LABELS.RENEW) {
+                if (!parseDateValue(getCellRaw(cRow, ch['新契約開始日']))) {
+                    errors.push(`${vehicleLabel}: 新契約開始日が未入力です`);
+                }
+                if (!parseDateValue(getCellRaw(cRow, ch['新契約満了日']))) {
+                    errors.push(`${vehicleLabel}: 新契約満了日が未入力です`);
+                }
+            }
+            if (policy && policy !== ANSWER_LABELS.RENEW) {
+                if (!isCheckedCell(getCellRaw(cRow, ch['解約完了']))) {
+                    errors.push(`${vehicleLabel}: 解約完了がチェックされていません`);
+                }
+            }
+            if (errors.length > 0) {
+                allErrors.push(...errors);
                 skipped += 1;
                 continue;
             }
@@ -971,10 +1004,6 @@ function applyMasterUpdates(batchId) {
             if (policy === ANSWER_LABELS.RENEW) {
                 const newStart = parseDateValue(getCellRaw(cRow, ch['新契約開始日']));
                 const newEnd = parseDateValue(getCellRaw(cRow, ch['新契約満了日']));
-                if (!newStart || !newEnd) {
-                    skipped += 1;
-                    continue;
-                }
                 setVehicle('契約開始日', toDateOnly(newStart, tz));
                 setVehicle('契約満了日', toDateOnly(newEnd, tz));
                 setVehicle('更新方針', policy);
@@ -985,11 +1014,6 @@ function applyMasterUpdates(batchId) {
                 setVehicle('完了メモ', '半期バッチで更新反映');
             }
             else {
-                const cancelDone = isCheckedCell(getCellRaw(cRow, ch['解約完了']));
-                if (!cancelDone) {
-                    skipped += 1;
-                    continue;
-                }
                 setVehicle('更新方針', policy);
                 setVehicle('一次回答', policy);
                 setVehicle('最終決定', policy);
@@ -998,13 +1022,15 @@ function applyMasterUpdates(batchId) {
                 setVehicle('完了メモ', '半期バッチで解約反映');
                 rowIndexesToGray.push(vehicleRowIndex + 1);
             }
-            if (ch['マスター反映済み'])
-                cRow[ch['マスター反映済み'] - 1] = true;
             if (ch['反映日時'])
                 cRow[ch['反映日時'] - 1] = now;
             applied += 1;
             modifiedVehicle = true;
             modifiedConfirmation = true;
+        }
+        if (allErrors.length > 0) {
+            const ui = SpreadsheetApp.getUi();
+            ui.alert('確認が必要な項目があります', allErrors.join('\n'), ui.ButtonSet.OK);
         }
         if (modifiedVehicle) {
             vehicleSheet.getRange(1, 1, vehicleData.length, vehicleData[0].length).setValues(vehicleData);
@@ -2129,7 +2155,7 @@ function summarizeConfirmationSheetRows(data, headerMap) {
         if (!isCheckedCell(getCellRaw(row, headerMap['回答確認済み']))) {
             result.unchecked += 1;
         }
-        if (isCheckedCell(getCellRaw(row, headerMap['マスター反映済み']))) {
+        if (getCellValue(row, headerMap['反映日時'])) {
             result.masterApplied += 1;
         }
     }
@@ -2230,6 +2256,7 @@ function loadSettings() {
         autoApplySenmuDecision: toBoolean(values['自動進行_専務判断反映_有効'], Boolean(SETTINGS_DEFAULTS['自動進行_専務判断反映_有効'])),
         autoApplyMasterUpdates: toBoolean(values['自動進行_マスター反映_有効'], Boolean(SETTINGS_DEFAULTS['自動進行_マスター反映_有効'])),
         autoAdvanceMinIntervalSec: toNumber(values['自動進行_最小間隔秒'], Number(SETTINGS_DEFAULTS['自動進行_最小間隔秒'])),
+        finalApproverAccount: toStringValue(values['最終承認者アカウント'], String(SETTINGS_DEFAULTS['最終承認者アカウント'])),
     };
 }
 function toNumber(value, fallback) {
@@ -2429,17 +2456,14 @@ function protectSenmuColumns(sheetName) {
         catch (err) {
             Logger.log(`protectSenmuColumns removeEditors: ${sheetName} ${err}`);
         }
-        try {
-            protection.addEditor(Session.getEffectiveUser());
-        }
-        catch (err) {
-            Logger.log(`protectSenmuColumns add effective user: ${sheetName} ${err}`);
-        }
-        try {
-            protection.addEditor(Session.getActiveUser());
-        }
-        catch (err) {
-            Logger.log(`protectSenmuColumns add active user: ${sheetName} ${err}`);
+        const settings = loadSettings();
+        if (settings.finalApproverAccount) {
+            try {
+                protection.addEditor(settings.finalApproverAccount);
+            }
+            catch (err) {
+                Logger.log(`protectSenmuColumns add finalApprover: ${sheetName} ${err}`);
+            }
         }
     }
     catch (err) {
