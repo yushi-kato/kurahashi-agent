@@ -158,6 +158,7 @@ function onOpen() {
     const ui = SpreadsheetApp.getUi();
     ui.createMenu('車両更新通知')
         .addItem('運用マニュアル（このシートで見る）', 'showOperationManual')
+        .addItem('テスト手順書（このシートで見る）', 'showTestGuide')
         .addItem('半期一括実行', 'runDaily')
         .addSeparator()
         .addSubMenu(ui.createMenu('手動ステップ')
@@ -186,6 +187,13 @@ function showOperationManual() {
         .setWidth(1000)
         .setHeight(800);
     ui.showModalDialog(html, '運用マニュアル');
+}
+function showTestGuide() {
+    const ui = SpreadsheetApp.getUi();
+    const html = HtmlService.createHtmlOutputFromFile('test_guide')
+        .setWidth(1000)
+        .setHeight(800);
+    ui.showModalDialog(html, 'テスト手順書');
 }
 function uiAlertSafe(message) {
     try {

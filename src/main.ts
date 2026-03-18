@@ -152,6 +152,7 @@ const SETTINGS_DEFAULTS: { [key: string]: string | number | boolean } = {
   自動進行_専務判断反映_有効: true,
   自動進行_マスター反映_有効: true,
   自動進行_最小間隔秒: 30,
+  最終承認者アカウント: '',
 };
 
 const SCHEMA_VERSION = '1';
@@ -167,6 +168,7 @@ function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('車両更新通知')
     .addItem('運用マニュアル（このシートで見る）', 'showOperationManual')
+    .addItem('テスト手順書（このシートで見る）', 'showTestGuide')
     .addItem('半期一括実行', 'runDaily')
     .addSeparator()
     .addSubMenu(
@@ -202,6 +204,14 @@ function showOperationManual() {
     .setWidth(1000)
     .setHeight(800);
   ui.showModalDialog(html, '運用マニュアル');
+}
+
+function showTestGuide() {
+  const ui = SpreadsheetApp.getUi();
+  const html = HtmlService.createHtmlOutputFromFile('test_guide')
+    .setWidth(1000)
+    .setHeight(800);
+  ui.showModalDialog(html, 'テスト手順書');
 }
 
 function uiAlertSafe(message: string) {
@@ -2376,6 +2386,10 @@ function loadSettings() {
       values['自動進行_最小間隔秒'],
       Number(SETTINGS_DEFAULTS['自動進行_最小間隔秒']),
     ),
+    finalApproverAccount: toStringValue(
+      values['最終承認者アカウント'],
+      String(SETTINGS_DEFAULTS['最終承認者アカウント']),
+    ),
   };
 }
 
@@ -2573,15 +2587,13 @@ function protectSenmuColumns(sheetName: string) {
     } catch (err) {
       Logger.log(`protectSenmuColumns removeEditors: ${sheetName} ${err}`);
     }
-    try {
-      protection.addEditor(Session.getEffectiveUser());
-    } catch (err) {
-      Logger.log(`protectSenmuColumns add effective user: ${sheetName} ${err}`);
-    }
-    try {
-      protection.addEditor(Session.getActiveUser());
-    } catch (err) {
-      Logger.log(`protectSenmuColumns add active user: ${sheetName} ${err}`);
+    const settings = loadSettings();
+    if (settings.finalApproverAccount) {
+      try {
+        protection.addEditor(settings.finalApproverAccount);
+      } catch (err) {
+        Logger.log(`protectSenmuColumns add finalApprover: ${sheetName} ${err}`);
+      }
     }
   } catch (err) {
     Logger.log(`protectSenmuColumns: ${sheetName} ${err}`);

@@ -1,0 +1,142 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      :root { color-scheme: light; }
+      body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; line-height: 1.6; padding: 16px; }
+      h1 { font-size: 20px; margin: 0 0 12px; }
+      h2 { font-size: 16px; margin: 18px 0 8px; border-top: 1px solid #eee; padding-top: 12px; }
+      h3 { font-size: 14px; margin: 14px 0 6px; }
+      p { margin: 8px 0; }
+      ul, ol { margin: 8px 0 8px 20px; padding: 0; }
+      li { margin: 4px 0; }
+      table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+      th, td { border: 1px solid #ddd; padding: 6px 8px; vertical-align: top; text-align: left; }
+      th { background: #f8f8f8; }
+      code { background: #f6f8fa; padding: 1px 4px; border-radius: 4px; }
+      pre { background: #f6f8fa; padding: 10px; border-radius: 8px; overflow: auto; }
+      pre code { background: none; padding: 0; }
+      a { color: #0b57d0; text-decoration: underline; }
+      .footer { margin-top: 18px; font-size: 12px; color: #666; }
+      .mermaid { background: #f6f8fa; padding: 10px; border-radius: 8px; text-align: center; }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <script>
+      mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+  </head>
+  <body>
+<h1 id="テスト手順書-―-一連の流れを体験する">テスト手順書 ― 一連の流れを体験する</h1>
+<p>このドキュメントでは、テストデータを使ってシステムの流れをひと通り体験する手順を説明します。テストデータはすでにシートに入っている状態を想定しています。</p>
+<hr>
+<h2 id="事前準備">事前準備</h2>
+<p>テスト中に送られるメールが自分に届くよう、通知先を変更します。</p>
+<h3 id="1-通知先メールアドレスを自分のものに変える">1. 通知先メールアドレスを自分のものに変える</h3>
+<ol>
+<li>スプレッドシートの「<strong>設定</strong>」シートを開く</li>
+<li>以下の 4 つの項目を探し、メールアドレスを <strong>自分のアドレス</strong> に書き換える</li>
+</ol>
+<table>
+<thead><tr><th>項目名</th><th>現在の値（例）</th></tr></thead>
+<tbody>
+<tr><td><code>本部長副本部長_通知先To</code></td><td>yushi.kato@futurelink.co.jp</td></tr>
+<tr><td><code>専務_通知先To</code></td><td>yushi.kato@futurelink.co.jp</td></tr>
+<tr><td><code>管理者_通知先To</code></td><td>a-kurahashi@kurahashi.co.jp</td></tr>
+<tr><td><code>車両管理担当_通知先To</code></td><td>a-kurahashi@kurahashi.co.jp</td></tr>
+</tbody>
+</table>
+<p>&gt; すべて自分のメールアドレスに変えておくと、各ステップで届くメールを確認できます。</p>
+<h3 id="2-メール送信が有効になっているか確認する">2. メール送信が有効になっているか確認する</h3>
+<p>同じ「<strong>設定</strong>」シートで、<code>通知_メール送信</code> の値が <strong>TRUE</strong> になっていることを確認してください。FALSE の場合はメールが送られません。</p>
+<h3 id="3-自動進行が有効になっているか確認する">3. 自動進行が有効になっているか確認する</h3>
+<p>同じ「<strong>設定</strong>」シートで、以下の項目がすべて <strong>TRUE</strong> になっていることを確認してください。</p>
+<table>
+<thead><tr><th>項目名</th><th>意味</th></tr></thead>
+<tbody>
+<tr><td><code>自動進行_有効</code></td><td>自動進行のマスタースイッチ</td></tr>
+<tr><td><code>自動進行_定期実行_有効</code></td><td>1 時間ごとの定期バッチを動かす</td></tr>
+<tr><td><code>自動進行_編集連動_有効</code></td><td>シートを編集したときにすぐ処理を動かす</td></tr>
+</tbody>
+</table>
+<p>&gt; 編集連動が有効だと、回答入力やチェックを入れた直後に自動処理が走ります。定期実行のみの場合は最大 1 時間待つことになります。</p>
+<h3 id="4-トリガーが設定されているか確認する">4. トリガーが設定されているか確認する</h3>
+<p>自動処理にはトリガー（定期実行の設定）が必要です。初めてテストする場合や、トリガーが未設定の場合は以下を実行してください。</p>
+<ol>
+<li>スプレッドシート上部のメニューから「<strong>管理・設定</strong>」を開く</li>
+<li>「<strong>半期トリガー再作成</strong>」をクリックする</li>
+</ol>
+<p>&gt; これで定期実行トリガーと編集連動トリガーがまとめて設定されます。すでに設定済みの場合は再作成されるだけなので、何度実行しても問題ありません。</p>
+<hr>
+<h2 id="テスト①-本部回答を入力してみる">テスト① 本部回答を入力してみる</h2>
+<p>本部長・副本部長が行う「更新 or 解約の回答」を体験します。</p>
+<ol>
+<li>「<strong>本部長副本部長確認_20260228</strong>」シートを開く</li>
+<li>テストデータの行を探す（管理番号が <strong>TEST-1001</strong>, <strong>TEST-1002</strong> の行）</li>
+<li>以下のように入力する</li>
+</ol>
+<table>
+<thead><tr><th>管理番号</th><th>「本部回答」列</th><th>「回答確認済み」列</th></tr></thead>
+<tbody>
+<tr><td>TEST-1001（更新対象）</td><td><strong>更新</strong> を選択</td><td>チェックを入れる</td></tr>
+<tr><td>TEST-1002（解約対象）</td><td><strong>解約（満了）</strong> を選択</td><td>チェックを入れる</td></tr>
+</tbody>
+</table>
+<ol>
+<li>他の行にも適当に回答を選び、チェックを入れる</li>
+<li><strong>全行にチェックが入ると、専務へ「承認依頼」メールが自動で送信される</strong></li>
+</ol>
+<p>&gt; メールが届くまで最大 1 時間ほどかかる場合があります。しばらく待ってメールが届いたことを確認してください。</p>
+<hr>
+<h2 id="テスト②-専務判断を入力してみる">テスト② 専務判断を入力してみる</h2>
+<p>専務が行う「承認 or 差戻し」の操作を体験します。</p>
+<ol>
+<li>同じ「<strong>本部長副本部長確認_20260228</strong>」シートを開いたまま</li>
+<li>「<strong>専務判断</strong>」列を探す</li>
+<li><strong>承認</strong> を入力する</li>
+</ol>
+<p>&gt; 入力すると、自動的に専務判断がバッチ処理に反映されます。待っていると自動で次のステップに進みます。</p>
+<hr>
+<h2 id="テスト③-最終入力-→-マスター反映">テスト③ 最終入力 → マスター反映</h2>
+<p>承認後の実務入力（新契約日の入力・解約完了チェック）を体験します。</p>
+<h3 id="test-1001更新の場合">TEST-1001（更新）の場合</h3>
+<ol>
+<li>TEST-1001 の行で「<strong>新契約開始日</strong>」「<strong>新契約満了日</strong>」に日付を入力する</li>
+</ol>
+<ul>
+<li>例：新契約開始日 → <code>2026/04/01</code>、新契約満了日 → <code>2029/03/31</code></li>
+</ul>
+<h3 id="test-1002解約の場合">TEST-1002（解約）の場合</h3>
+<ol>
+<li>TEST-1002 の行で「<strong>解約完了</strong>」にチェックを入れる</li>
+</ol>
+<h3 id="結果を確認する">結果を確認する</h3>
+<ul>
+<li>待っていると自動でマスター反映が実行される</li>
+<li>「<strong>車両一覧</strong>」シートを開き、TEST-1001・TEST-1002 の行が更新されていることを確認する</li>
+</ul>
+<p>&gt; マスター反映はバッチ処理のため、最大 1 時間ほどかかる場合があります。</p>
+<hr>
+<h2 id="テスト後の掃除">テスト後の掃除</h2>
+<p>テストデータ（TEST プレフィックスの付いたデータ）をまとめて削除します。</p>
+<ol>
+<li>スプレッドシート上部のメニューから「<strong>テスト・保守</strong>」を開く</li>
+<li>「<strong>テストデータ掃除</strong>」をクリックする</li>
+<li>確認ダイアログが出たら実行する</li>
+</ol>
+<p>&gt; これで TEST-xxxx の管理番号を持つデータが各シートから削除されます。</p>
+<hr>
+<h2 id="困ったとき">困ったとき</h2>
+<table>
+<thead><tr><th>症状</th><th>確認ポイント</th></tr></thead>
+<tbody>
+<tr><td>メールが届かない</td><td>「設定」シートの <code>通知_メール送信</code> が TRUE か確認。迷惑メールフォルダも確認</td></tr>
+<tr><td>自動処理が動かない</td><td>「設定」シートの <code>自動進行_有効</code> が TRUE か確認。トリガー未設定なら「管理・設定」→「半期トリガー再作成」を実行。それでも動かない場合は最大 1 時間待って再確認</td></tr>
+<tr><td>テストデータが見つからない</td><td>「本部長副本部長確認_20260228」シートで TEST-1001 を検索</td></tr>
+</tbody>
+</table>
+
+    <div class="footer">このページはMarkdownから自動生成されています。</div>
+  </body>
+</html>
