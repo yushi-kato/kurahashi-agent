@@ -92,6 +92,10 @@ npx clasp -u runscope run cleanupTestData
   - full-run時はテスト用メアド
 - `専務_通知先Cc`
   - 任意
+- `村田主任_通知先To`
+  - full-run時はテスト用メアド
+- `村田主任_通知先Cc`
+  - 任意
 - `半期送付日_3月`, `半期送付日_9月`
   - まずはデフォルトのままで可
 - `回答期限_3月`, `回答期限_9月`
@@ -223,6 +227,52 @@ npx clasp -u runscope run applySenmuDecisionFromSheet
 - `通知バッチ.ステータス` が `専務承認済` または `専務差戻し`
 - `通知ログ` に 承認/差戻し/保留/不正 の集計が残る
 
+### 5.5a 差戻し通知（差戻しケース）
+
+確認用シートで:
+
+- 1行目 `専務判断=差戻し`
+- 2行目 `専務判断=承認`
+
+実行:
+
+```bash
+npx clasp -u runscope run applySenmuDecisionFromSheet
+npx clasp -u runscope run sendHqReturnNotification
+```
+
+確認ポイント:
+
+- `通知バッチ.ステータス` が `専務差戻し` → `初回通知送信済` に遷移
+- full-run: 本部長副本部長に差戻し通知メールが届く
+- 確認用シートで差戻し行の `本部回答`/`回答確認済み`/`専務判断`/`専務コメント` がクリアされている
+- 承認行はそのまま残っている
+- `通知バッチ.専務依頼送信日時`、`村田主任通知送信日時`、`リマインド送信日時` がクリアされている
+- `通知ログ` に「差戻し通知」の成功ログが残る
+
+差戻し後のループ確認:
+
+- 差戻し行のみ `本部回答` を再入力し `回答確認済み=TRUE` にする
+- `sendSenmuApprovalRequestIfReady` を実行 → 専務依頼が再送信される
+
+### 5.5b 村田主任通知（全件承認ケース）
+
+確認用シートで全行を `専務判断=承認` にした状態で:
+
+実行:
+
+```bash
+npx clasp -u runscope run applySenmuDecisionFromSheet
+npx clasp -u runscope run sendMurataApprovalNotification
+```
+
+確認ポイント:
+
+- full-run: 村田主任に通知メールが届く（件名: 「マスター反映依頼」）
+- `通知バッチ.村田主任通知送信日時` が記録される
+- `通知ログ` に「村田主任通知」の成功ログが残る
+- 2回目実行で重複送信されない（`村田主任通知送信日時` が既に設定済みのためスキップ）
+
 ### 5.6 マスター反映
 
 確認用シートで:
@@ -257,6 +307,15 @@ npx clasp -u runscope run applyMasterUpdates
 
 4. 専務承認/差戻し確定
 - `applySenmuDecisionFromSheet` 後のステータス遷移
+
+4a. 差戻し時のループ確認
+- `sendHqReturnNotification` 後にステータスが `初回通知送信済` に戻る
+- 差戻し行のみフィールドがクリアされ、承認行は維持される
+- 再回答→再専務依頼のループが成立する
+
+4b. 村田主任通知確認
+- `sendMurataApprovalNotification` 後に `村田主任通知送信日時` が記録される
+- 2回目実行で重複送信されない
 
 5. 村田主任入力済み行のみ反映
 - 更新: 新契約日2項目必須
