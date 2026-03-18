@@ -85,11 +85,6 @@ sequenceDiagram
     end
 
     Senmu->>Conf: 専務判断/専務コメントを入力する
-    Murata->>Conf: 新契約日付 または 解約完了を入力する
-
-    Ledger->>GAS: 車両一覧の編集イベントで同期を起動
-    GAS->>List: onEditSourceSync で最小間隔ガード判定
-    GAS->>Need: 条件一致時に要入力を更新
 
     HQ->>GAS: 確認用シート編集イベントで自動進行を起動
     Senmu->>GAS: 確認用シート編集イベントで自動進行を起動
@@ -99,6 +94,25 @@ sequenceDiagram
         GAS->>Batch: 専務判断ステータスを更新する
         GAS->>Log: 専務判断反映結果を記録する
     end
+    alt 差戻しあり かつ 全行判断入力済み
+        GAS->>HQ: 差戻し通知メールを送信する
+        GAS->>Conf: 差戻し行の本部回答/確認済み/専務判断/コメントをクリアする
+        GAS->>Batch: ステータスを初回通知送信済に戻す
+        GAS->>Log: 差戻し通知結果を記録する
+        Note over HQ,Conf: HQが差戻し行の再回答を入力 → 専務依頼が再送信されるループ
+    end
+    alt 全件承認
+        GAS->>Murata: 村田主任通知メールを送信する
+        GAS->>Batch: 村田主任通知送信日時を記録する
+        GAS->>Log: 村田主任通知結果を記録する
+    end
+
+    Murata->>Conf: 新契約日付 または 解約完了を入力する
+
+    Ledger->>GAS: 車両一覧の編集イベントで同期を起動
+    GAS->>List: onEditSourceSync で最小間隔ガード判定
+    GAS->>Need: 条件一致時に要入力を更新
+
     alt マスター反映が有効かつ条件一致
         GAS->>List: 承認済みかつ入力完了行を反映する
         GAS->>Conf: 反映済み/反映日時を更新する
