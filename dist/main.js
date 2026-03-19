@@ -1401,6 +1401,40 @@ function onEditSourceSync(e) {
     syncVehicles();
     return 'ok';
 }
+function onEditSettingsSync(e) {
+    if (!e || !e.range)
+        return '';
+    const sheet = e.range.getSheet();
+    if (!sheet || sheet.getName() !== SHEET_NAMES.SETTINGS)
+        return '';
+    const data = sheet.getDataRange().getValues();
+    const headerMap = getHeaderMap(data[0]);
+    if (!headerMap['設定項目'] || !headerMap['値'])
+        return '';
+    const valCol = headerMap['値'];
+    const startCol = e.range.getColumn();
+    const endCol = startCol + e.range.getNumColumns() - 1;
+    if (valCol < startCol || valCol > endCol)
+        return '';
+    const startRow = e.range.getRow();
+    const endRow = startRow + e.range.getNumRows() - 1;
+    let found = false;
+    for (let r = startRow; r <= endRow; r++) {
+        if (getCellValue(data[r - 1], headerMap['設定項目']) === '最終承認者アカウント') {
+            found = true;
+            break;
+        }
+    }
+    if (!found)
+        return '';
+    const ss = getSpreadsheet();
+    ss.getSheets().forEach((s) => {
+        if (isConfirmationSheetName(s.getName())) {
+            protectSenmuColumns(s.getName());
+        }
+    });
+    return 'ok';
+}
 function advanceBiannualWorkflow(batchId, reason) {
     const settings = loadSettings();
     if (!settings.autoAdvanceEnabled)
@@ -1855,7 +1889,7 @@ function installDailyTriggers() {
     const settings = loadSettings();
     const ss = getSpreadsheet();
     const tz = ss.getSpreadsheetTimeZone();
-    const managedHandlers = ['runDaily', 'runBiannualSchedule', 'runAutoAdvance', 'onEditAutoAdvance', 'onEditSourceSync', 'syncVehicles'];
+    const managedHandlers = ['runDaily', 'runBiannualSchedule', 'runAutoAdvance', 'onEditAutoAdvance', 'onEditSourceSync', 'onEditSettingsSync', 'syncVehicles'];
     const triggers = ScriptApp.getProjectTriggers();
     triggers.forEach((trigger) => {
         const handler = trigger.getHandlerFunction();
@@ -1896,6 +1930,7 @@ function installDailyTriggers() {
     }
     ScriptApp.newTrigger('syncVehicles').timeBased().everyHours(1).create();
     ScriptApp.newTrigger('onEditSourceSync').forSpreadsheet(ss).onEdit().create();
+    ScriptApp.newTrigger('onEditSettingsSync').forSpreadsheet(ss).onEdit().create();
     if (settings.autoAdvanceEnabled && settings.autoAdvanceOnEditEnabled) {
         ScriptApp.newTrigger('onEditAutoAdvance').forSpreadsheet(ss).onEdit().create();
     }
