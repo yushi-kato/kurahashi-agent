@@ -313,6 +313,11 @@ const targets = [
     inputs: [path.join(repoRoot, 'docs', 'operations', 'test_guide.md')],
     output: path.join(repoRoot, 'dist', 'test_guide.html'),
   },
+  {
+    label: '初期車両登録マニュアル',
+    inputs: [path.join(repoRoot, 'docs', 'operations', 'operation_manual_initial_vehicle_registration.md')],
+    output: path.join(repoRoot, 'dist', 'operation_manual_initial_vehicle_registration.html'),
+  },
 ];
 
 for (const target of targets) {
