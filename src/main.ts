@@ -172,6 +172,7 @@ function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('車両更新通知')
     .addItem('運用マニュアル（このシートで見る）', 'showOperationManual')
+    .addItem('初期車両登録マニュアル（このシートで見る）', 'showInitialVehicleRegistrationManual')
     .addItem('テスト手順書（このシートで見る）', 'showTestGuide')
     .addItem('半期一括実行', 'runDaily')
     .addSeparator()
@@ -210,6 +211,14 @@ function showOperationManual() {
     .setWidth(1000)
     .setHeight(800);
   ui.showModalDialog(html, '運用マニュアル');
+}
+
+function showInitialVehicleRegistrationManual() {
+  const ui = SpreadsheetApp.getUi();
+  const html = HtmlService.createHtmlOutputFromFile('operation_manual_initial_vehicle_registration')
+    .setWidth(1000)
+    .setHeight(800);
+  ui.showModalDialog(html, '初期車両登録マニュアル');
 }
 
 function showTestGuide() {
