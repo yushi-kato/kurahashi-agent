@@ -1389,8 +1389,6 @@ function onEditAutoAdvance(e) {
     const headerMap = getHeaderMap(headerValues);
     if (!rangeTouchesHeaders(range, headerMap, AUTO_ADVANCE_EDIT_WATCH_HEADERS))
         return '';
-    if (!tryReserveAutoAdvanceRun(settings.autoAdvanceMinIntervalSec))
-        return '';
     const batchId = resolveBatchIdFromConfirmationEdit(sheet, range.getRow(), headerMap);
     return advanceBiannualWorkflow(batchId, 'onEdit');
 }
