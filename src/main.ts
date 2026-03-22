@@ -45,6 +45,7 @@ const AUTO_ADVANCE_EDIT_WATCH_HEADERS = [
   '回答確認済み',
   '専務判断',
   '専務コメント',
+  '専務確認済み',
   '新契約開始日',
   '新契約満了日',
   '解約完了',
@@ -67,6 +68,7 @@ const HQ_CONFIRMATION_HEADERS = [
   '回答確認済み',
   '専務判断',
   '専務コメント',
+  '専務確認済み',
   '新契約開始日',
   '新契約満了日',
   '解約完了',
@@ -549,6 +551,7 @@ function buildConfirmationSheet(batchId: string) {
     false,
     '',
     '',
+    false,
     '',
     '',
     false,
@@ -559,7 +562,7 @@ function buildConfirmationSheet(batchId: string) {
   writeArbitrarySheetData(sheet, HQ_CONFIRMATION_HEADERS, rows);
   const headerMap = getHeaderMap(HQ_CONFIRMATION_HEADERS);
   if (rows.length > 0) {
-    const checkColumns = ['回答確認済み', '解約完了', '村田主任確認済み'];
+    const checkColumns = ['回答確認済み', '解約完了', '村田主任確認済み', '専務確認済み'];
     checkColumns.forEach((name) => {
       const col = headerMap[name];
       if (!col) return;
@@ -808,6 +811,7 @@ function sendSenmuApprovalRequestIfReady(batchId?: string) {
       appendNotificationLog('専務依頼', '', '', resolvedBatchId, `確認用シート不在: ${confirmationSheetName}`);
       return resolvedBatchId;
     }
+    ensureConfirmationSheetSchema(confirmationSheet);
 
     const confirmationData = confirmationSheet.getDataRange().getValues();
     const confirmationHeader = confirmationData.length > 0 ? getHeaderMap(confirmationData[0]) : {};
@@ -852,6 +856,7 @@ function sendSenmuApprovalRequestIfReady(batchId?: string) {
       sheetUrl,
       '',
       `専務判断の入力値: ${APPROVAL_INPUT.APPROVE} / ${APPROVAL_INPUT.RETURN}`,
+      '※ 全行の判断入力後、各行の「専務確認済み」にもチェックを入れてください。',
     ].join('\n');
 
     try {
@@ -900,18 +905,20 @@ function applySenmuDecisionFromSheet(batchId?: string) {
       uiAlertSafe(`確認用シートが見つかりません。\n${confirmationSheetName}`);
       return resolvedBatchId;
     }
-    protectSenmuColumns(confirmationSheetName);
+    ensureConfirmationSheetSchema(sheet);
 
     const data = sheet.getDataRange().getValues();
     if (data.length <= 1) return resolvedBatchId;
     const h = getHeaderMap(data[0]);
     const decisionIndex = h['専務判断'];
     if (!decisionIndex) return resolvedBatchId;
+    const senmuCheckIndex = h['専務確認済み'];
 
     let approved = 0;
     let returned = 0;
     let pending = 0;
     let invalid = 0;
+    let senmuUnchecked = 0;
     const invalidRows: string[] = [];
 
     for (let i = 1; i < data.length; i++) {
@@ -931,15 +938,35 @@ function applySenmuDecisionFromSheet(batchId?: string) {
       }
       if (decision === APPROVAL_INPUT.APPROVE) approved += 1;
       if (decision === APPROVAL_INPUT.RETURN) returned += 1;
+      if (senmuCheckIndex && !isCheckedCell(getCellRaw(rowData, senmuCheckIndex))) {
+        senmuUnchecked += 1;
+      }
     }
 
     const now = new Date();
+    const currentStatus = getCellValue(row, headerMap['ステータス']);
+    const allDecided = pending === 0 && invalid === 0;
+    const allChecked = senmuUnchecked === 0;
+
+    if (!allDecided || !allChecked) {
+      // 条件未達: 承認済/差戻しから崩れた場合は専務依頼送信済に戻す
+      if (
+        currentStatus === BIANNUAL_BATCH_STATUS.SENMU_APPROVED ||
+        currentStatus === BIANNUAL_BATCH_STATUS.SENMU_RETURNED
+      ) {
+        row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_REQUESTED;
+        row[headerMap['更新日時'] - 1] = now;
+        notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
+      }
+      appendNotificationLog('専務判断反映', '', '', resolvedBatchId,
+        `未達: 保留=${pending} 不正=${invalid} 未確認=${senmuUnchecked}`);
+      return resolvedBatchId;
+    }
+
     if (returned > 0) {
       row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_RETURNED;
-    } else if (approved > 0 && pending === 0 && invalid === 0) {
+    } else if (approved > 0) {
       row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_APPROVED;
-    } else {
-      row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_REQUESTED;
     }
     row[headerMap['更新日時'] - 1] = now;
     notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
@@ -998,6 +1025,7 @@ function sendHqReturnNotification(batchId?: string) {
     if (!confirmationSheetName) return resolvedBatchId;
     const confirmationSheet = ss.getSheetByName(confirmationSheetName);
     if (!confirmationSheet) return resolvedBatchId;
+    ensureConfirmationSheetSchema(confirmationSheet);
 
     const confirmationData = confirmationSheet.getDataRange().getValues();
     if (confirmationData.length <= 1) return resolvedBatchId;
@@ -1077,15 +1105,13 @@ function sendHqReturnNotification(batchId?: string) {
       throw err;
     }
 
-    // 差戻し行のみクリア
+    // 差戻し行のHQ側列のみクリア（専務判断・専務コメント・専務確認済みはフィードバックとして残す）
     let modified = false;
     for (const r of returnedRows) {
       const cRow = confirmationData[r.rowIndex];
       if (ch['本部回答']) cRow[ch['本部回答'] - 1] = '';
-      if (ch['回答確認済み']) cRow[ch['回答確認済み'] - 1] = '';
-      if (ch['専務判断']) cRow[ch['専務判断'] - 1] = '';
-      if (ch['専務コメント']) cRow[ch['専務コメント'] - 1] = '';
-      if (ch['村田主任確認済み']) cRow[ch['村田主任確認済み'] - 1] = '';
+      if (ch['回答確認済み']) cRow[ch['回答確認済み'] - 1] = false;
+      if (ch['村田主任確認済み']) cRow[ch['村田主任確認済み'] - 1] = false;
       if (ch['反映日時']) cRow[ch['反映日時'] - 1] = '';
       modified = true;
     }
@@ -1477,6 +1503,16 @@ function onEditAutoAdvance(e: GoogleAppsScript.Events.SheetsOnEdit) {
   const headerValues = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
   const headerMap = getHeaderMap(headerValues);
   if (!rangeTouchesHeaders(range, headerMap, AUTO_ADVANCE_EDIT_WATCH_HEADERS)) return '';
+
+  // 本部回答の再入力時に差戻し行の専務列を自動クリア
+  if (rangeTouchesHeaders(range, headerMap, ['本部回答'])) {
+    const batchIdForClear = resolveBatchIdFromConfirmationEdit(sheet, range.getRow(), headerMap);
+    const ctx = getNotifyBatchContext(batchIdForClear);
+    if (ctx) {
+      const status = getCellValue(ctx.row, ctx.headerMap['ステータス']);
+      clearReturnedSenmuStateOnReAnswer(sheet, range, headerMap, status);
+    }
+  }
 
   const batchId = resolveBatchIdFromConfirmationEdit(sheet, range.getRow(), headerMap);
   return advanceBiannualWorkflow(batchId, 'onEdit');
@@ -2870,6 +2906,76 @@ function protectViewSheet(sheetName: string) {
   }
 }
 
+function clearReturnedSenmuStateOnReAnswer(
+  sheet: GoogleAppsScript.Spreadsheet.Sheet,
+  range: GoogleAppsScript.Spreadsheet.Range,
+  headerMap: { [key: string]: number },
+  batchStatus: string,
+) {
+  // 差戻し後（INITIAL_SENTに戻った状態）でのみ発火
+  if (batchStatus !== BIANNUAL_BATCH_STATUS.INITIAL_SENT) return false;
+
+  const startRow = range.getRow();
+  const numRows = range.getNumRows();
+  const lastCol = sheet.getLastColumn();
+  const values = sheet.getRange(startRow, 1, numRows, lastCol).getValues();
+  let modified = false;
+
+  values.forEach((row) => {
+    const decision = normalizeSenmuDecision(getCellValue(row, headerMap['専務判断']));
+    if (decision !== APPROVAL_INPUT.RETURN) return; // 差戻し行のみ対象
+    if (headerMap['専務判断']) row[headerMap['専務判断'] - 1] = '';
+    if (headerMap['専務コメント']) row[headerMap['専務コメント'] - 1] = '';
+    if (headerMap['専務確認済み']) row[headerMap['専務確認済み'] - 1] = false;
+    modified = true;
+  });
+
+  if (modified) {
+    sheet.getRange(startRow, 1, numRows, lastCol).setValues(values);
+  }
+  return modified;
+}
+
+function ensureConfirmationSheetSchema(sheet: GoogleAppsScript.Spreadsheet.Sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return;
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const headerMap = getHeaderMap(headers);
+
+  // 専務確認済み列がなければ、専務コメントの直後（新契約開始日の手前）に挿入
+  if (!headerMap['専務確認済み']) {
+    const insertBefore = headerMap['新契約開始日'];
+    if (insertBefore && insertBefore <= sheet.getLastColumn()) {
+      sheet.insertColumnBefore(insertBefore);
+      sheet.getRange(1, insertBefore).setValue('専務確認済み');
+      if (lastRow > 1) {
+        sheet.getRange(2, insertBefore, lastRow - 1, 1).insertCheckboxes();
+      }
+    } else {
+      // 新契約開始日が見つからない場合は末尾に追加
+      const newCol = sheet.getLastColumn() + 1;
+      sheet.getRange(1, newCol).setValue('専務確認済み');
+      if (lastRow > 1) {
+        sheet.getRange(2, newCol, lastRow - 1, 1).insertCheckboxes();
+      }
+    }
+  }
+
+  // 既存だがチェックボックスでない場合の保険
+  const updatedHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const updatedMap = getHeaderMap(updatedHeaders);
+  const senmuCheckCol = updatedMap['専務確認済み'];
+  if (senmuCheckCol && lastRow > 1) {
+    const range = sheet.getRange(2, senmuCheckCol, lastRow - 1, 1);
+    const validations = range.getDataValidations();
+    if (!validations || !validations[0] || !validations[0][0]) {
+      range.insertCheckboxes();
+    }
+  }
+
+  protectSenmuColumns(sheet.getName());
+}
+
 function protectSenmuColumns(sheetName: string) {
   const ss = getSpreadsheet();
   const sheet = ss.getSheetByName(sheetName);
@@ -2879,10 +2985,12 @@ function protectSenmuColumns(sheetName: string) {
   const headerMap = getHeaderMap(sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]);
   const decisionCol = headerMap['専務判断'];
   const commentCol = headerMap['専務コメント'];
+  const senmuCheckCol = headerMap['専務確認済み'];
   if (!decisionCol || !commentCol) return;
 
-  const startCol = Math.min(decisionCol, commentCol);
-  const endCol = Math.max(decisionCol, commentCol);
+  const cols = [decisionCol, commentCol, senmuCheckCol].filter((c): c is number => !!c);
+  const startCol = Math.min(...cols);
+  const endCol = Math.max(...cols);
   const width = endCol - startCol + 1;
   const desc = `managed_by_script:senmu_columns:${sheetName}`;
 
