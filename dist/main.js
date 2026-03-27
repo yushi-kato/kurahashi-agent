@@ -35,17 +35,17 @@ const BIANNUAL_BATCH_STATUS = {
     COMPLETED: '反映完了',
 };
 const HQ_CONFIRMATION_SHEET_PREFIX = '本部長副本部長確認_';
-const AUTO_ADVANCE_EDIT_WATCH_HEADERS = [
-    '本部回答',
-    '回答確認済み',
-    '専務判断',
-    '専務コメント',
-    '専務確認済み',
-    '新契約開始日',
-    '新契約満了日',
-    '解約完了',
-    '村田主任確認済み',
-];
+const AUTO_ADVANCE_INTERVAL_MINUTES = [1, 5, 10, 15, 30];
+const BATCH_PHASE = {
+    INITIAL_PENDING: 'INITIAL_PENDING',
+    HQ_WAITING: 'HQ_WAITING',
+    SENMU_REQUEST_READY: 'SENMU_REQUEST_READY',
+    SENMU_WAITING: 'SENMU_WAITING',
+    SENMU_RETURN_READY: 'SENMU_RETURN_READY',
+    MURATA_NOTIFY_READY: 'MURATA_NOTIFY_READY',
+    MASTER_APPLY_READY: 'MASTER_APPLY_READY',
+    COMPLETED: 'COMPLETED',
+};
 const HQ_CONFIRMATION_HEADERS = [
     'batchId',
     'vehicleId',
@@ -144,8 +144,8 @@ const SETTINGS_DEFAULTS = {
     リマインド_期限前日数: 10,
     自動進行_有効: true,
     自動進行_定期実行_有効: true,
-    自動進行_定期実行_間隔時間: 1,
-    自動進行_編集連動_有効: true,
+    自動進行_定期実行_間隔分: 10,
+    自動進行_編集連動_有効: false,
     自動進行_専務判断反映_有効: true,
     自動進行_マスター反映_有効: true,
     自動進行_最小間隔秒: 30,
@@ -160,6 +160,7 @@ const PROP_KEYS = {
     LAST_SCHEMA_DRIFT_AT: 'LAST_SCHEMA_DRIFT_AT',
     AUTO_ADVANCE_LAST_RUN_AT: 'AUTO_ADVANCE_LAST_RUN_AT',
     SOURCE_SYNC_LAST_RUN_AT: 'SOURCE_SYNC_LAST_RUN_AT',
+    ONEDIT_ADVANCE_LAST_RUN_AT: 'ONEDIT_ADVANCE_LAST_RUN_AT',
 };
 function onOpen() {
     const ui = SpreadsheetApp.getUi();
@@ -733,9 +734,10 @@ function sendSenmuApprovalRequestIfReady(batchId) {
     lock.waitLock(30000);
     try {
         const settings = loadSettings();
-        const batchContext = getNotifyBatchContext(batchId);
-        if (!batchContext)
+        const snapshot = getBatchWorkflowSnapshot(batchId);
+        if (!snapshot)
             return '';
+        const { batchContext, confirmationSheet, confirmationData, confirmationHeader, hqGate } = snapshot;
         const { ss, notifyBatchSheet, batchData, headerMap, row } = batchContext;
         const resolvedBatchId = batchContext.batchId;
         const tz = ss.getSpreadsheetTimeZone();
@@ -743,28 +745,21 @@ function sendSenmuApprovalRequestIfReady(batchId) {
         const sentAt = parseDateValue(getCellRaw(row, headerMap['専務依頼送信日時']));
         if (sentAt)
             return resolvedBatchId;
-        const confirmationSheetName = getCellValue(row, headerMap['確認用シート名']);
-        if (!confirmationSheetName) {
+        if (!confirmationSheet) {
+            const confirmationSheetName = getCellValue(row, headerMap['確認用シート名']);
             appendNotificationLog('専務依頼', '', '', resolvedBatchId, '確認用シート未設定のためスキップ');
             return resolvedBatchId;
         }
-        const confirmationSheet = ss.getSheetByName(confirmationSheetName);
-        if (!confirmationSheet) {
-            appendNotificationLog('専務依頼', '', '', resolvedBatchId, `確認用シート不在: ${confirmationSheetName}`);
-            return resolvedBatchId;
-        }
         ensureConfirmationSheetSchema(confirmationSheet);
-        const confirmationData = confirmationSheet.getDataRange().getValues();
-        const confirmationHeader = confirmationData.length > 0 ? getHeaderMap(confirmationData[0]) : {};
         const counts = summarizeConfirmationSheetRows(confirmationData, confirmationHeader);
-        if (counts.total <= 0)
+        if (hqGate.total <= 0)
             return resolvedBatchId;
-        if (counts.unchecked > 0) {
-            appendNotificationLog('専務依頼', '', '', resolvedBatchId, `未確認行あり(${counts.unchecked}件)のため未送信`);
+        if (hqGate.unchecked > 0) {
+            appendNotificationLog('専務依頼', '', '', resolvedBatchId, `未確認行あり(${hqGate.unchecked}件)のため未送信`);
             return resolvedBatchId;
         }
-        if (counts.unanswered > 0) {
-            appendNotificationLog('専務依頼', '', '', resolvedBatchId, `未回答行あり(${counts.unanswered}件)のため未送信`);
+        if (hqGate.pending > 0) {
+            appendNotificationLog('専務依頼', '', '', resolvedBatchId, `未回答行あり(${hqGate.pending}件)のため未送信`);
             return resolvedBatchId;
         }
         if (!settings.mailSendEnabled) {
@@ -811,7 +806,7 @@ function sendSenmuApprovalRequestIfReady(batchId) {
             row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_REQUESTED;
             row[headerMap['更新日時'] - 1] = now;
             notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
-            protectSenmuColumns(confirmationSheetName);
+            protectSenmuColumns(confirmationSheet.getName());
             appendNotificationLog('専務依頼', '', senmuTo, resolvedBatchId, '成功');
         }
         catch (err) {
@@ -824,43 +819,31 @@ function sendSenmuApprovalRequestIfReady(batchId) {
         lock.releaseLock();
     }
 }
-function applySenmuDecisionFromSheet(batchId) {
+function applySenmuDecisionFromSheet(batchId, options) {
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
     try {
-        const batchContext = getNotifyBatchContext(batchId);
-        if (!batchContext)
+        const snapshot = getBatchWorkflowSnapshot(batchId);
+        if (!snapshot)
             return '';
+        const { batchContext, confirmationSheet, confirmationData, confirmationHeader, senmuGate } = snapshot;
         const { notifyBatchSheet, batchData, headerMap, row } = batchContext;
         const resolvedBatchId = batchContext.batchId;
-        const confirmationSheetName = getCellValue(row, headerMap['確認用シート名']);
-        if (!confirmationSheetName) {
+        if (!confirmationSheet) {
             uiAlertSafe(`確認用シート名が未設定です。\nbatchId: ${resolvedBatchId}`);
             return resolvedBatchId;
         }
-        const ss = getSpreadsheet();
-        const sheet = ss.getSheetByName(confirmationSheetName);
-        if (!sheet) {
-            uiAlertSafe(`確認用シートが見つかりません。\n${confirmationSheetName}`);
+        ensureConfirmationSheetSchema(confirmationSheet);
+        if (confirmationData.length <= 1)
             return resolvedBatchId;
-        }
-        ensureConfirmationSheetSchema(sheet);
-        const data = sheet.getDataRange().getValues();
-        if (data.length <= 1)
-            return resolvedBatchId;
-        const h = getHeaderMap(data[0]);
+        const h = confirmationHeader;
         const decisionIndex = h['専務判断'];
         if (!decisionIndex)
             return resolvedBatchId;
         const senmuCheckIndex = h['専務確認済み'];
-        let approved = 0;
-        let returned = 0;
-        let pending = 0;
-        let invalid = 0;
-        let senmuUnchecked = 0;
         const invalidRows = [];
-        for (let i = 1; i < data.length; i++) {
-            const rowData = data[i];
+        for (let i = 1; i < confirmationData.length; i++) {
+            const rowData = confirmationData[i];
             const vehicleId = getCellValue(rowData, h['vehicleId']);
             if (!vehicleId)
                 continue;
@@ -868,26 +851,19 @@ function applySenmuDecisionFromSheet(batchId) {
             if (!decision) {
                 const raw = getCellValue(rowData, decisionIndex);
                 if (raw) {
-                    invalid += 1;
                     invalidRows.push(`行${i + 1}: ${raw}`);
                 }
-                else {
-                    pending += 1;
-                }
                 continue;
-            }
-            if (decision === APPROVAL_INPUT.APPROVE)
-                approved += 1;
-            if (decision === APPROVAL_INPUT.RETURN)
-                returned += 1;
-            if (senmuCheckIndex && !isCheckedCell(getCellRaw(rowData, senmuCheckIndex))) {
-                senmuUnchecked += 1;
             }
         }
         const now = new Date();
         const currentStatus = getCellValue(row, headerMap['ステータス']);
-        const allDecided = pending === 0 && invalid === 0;
-        const allChecked = senmuUnchecked === 0;
+        if (currentStatus === BIANNUAL_BATCH_STATUS.COMPLETED) {
+            appendNotificationLog('専務判断反映', '', '', resolvedBatchId, '反映完了のため再判定をスキップ');
+            return resolvedBatchId;
+        }
+        const allDecided = senmuGate.pending === 0 && senmuGate.invalid === 0;
+        const allChecked = senmuGate.unchecked === 0;
         if (!allDecided || !allChecked) {
             // 条件未達: 承認済/差戻しから崩れた場合は専務依頼送信済に戻す
             if (currentStatus === BIANNUAL_BATCH_STATUS.SENMU_APPROVED ||
@@ -896,12 +872,12 @@ function applySenmuDecisionFromSheet(batchId) {
                 row[headerMap['更新日時'] - 1] = now;
                 notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
             }
-            appendNotificationLog('専務判断反映', '', '', resolvedBatchId, `未達: 保留=${pending} 不正=${invalid} 未確認=${senmuUnchecked}`);
+            appendNotificationLog('専務判断反映', '', '', resolvedBatchId, `未達: 保留=${senmuGate.pending} 不正=${senmuGate.invalid} 未確認=${senmuGate.unchecked}`);
             return resolvedBatchId;
         }
-        const newStatus = returned > 0
+        const newStatus = senmuGate.returned > 0
             ? BIANNUAL_BATCH_STATUS.SENMU_RETURNED
-            : approved > 0
+            : senmuGate.approved > 0
                 ? BIANNUAL_BATCH_STATUS.SENMU_APPROVED
                 : currentStatus;
         // ステータスに変化がなければ no-op（ログ・モーダル・更新日時すべてスキップ）
@@ -911,32 +887,35 @@ function applySenmuDecisionFromSheet(batchId) {
         row[headerMap['ステータス'] - 1] = newStatus;
         row[headerMap['更新日時'] - 1] = now;
         notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
-        appendNotificationLog('専務判断反映', '', '', resolvedBatchId, `承認:${approved} 差戻し:${returned} 保留:${pending} 不正:${invalid}`);
+        appendNotificationLog('専務判断反映', '', '', resolvedBatchId, `承認:${senmuGate.approved} 差戻し:${senmuGate.returned} 保留:${senmuGate.pending} 不正:${senmuGate.invalid}`);
         const lines = [
             `batchId: ${resolvedBatchId}`,
-            `承認: ${approved}`,
-            `差戻し: ${returned}`,
-            `保留: ${pending}`,
-            `不正入力: ${invalid}`,
+            `承認: ${senmuGate.approved}`,
+            `差戻し: ${senmuGate.returned}`,
+            `保留: ${senmuGate.pending}`,
+            `不正入力: ${senmuGate.invalid}`,
         ];
         if (invalidRows.length > 0) {
             lines.push('', '不正入力明細:', ...invalidRows.slice(0, 10));
         }
-        uiShowModalSafe('専務判断反映', lines.join('\n'));
+        if (!(options === null || options === void 0 ? void 0 : options.suppressUi)) {
+            uiShowModalSafe('専務判断反映', lines.join('\n'));
+        }
         return resolvedBatchId;
     }
     finally {
         lock.releaseLock();
     }
 }
-function sendHqReturnNotification(batchId) {
+function sendHqReturnNotification(batchId, options) {
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
     try {
         const settings = loadSettings();
-        const batchContext = getNotifyBatchContext(batchId);
-        if (!batchContext)
+        const snapshot = getBatchWorkflowSnapshot(batchId);
+        if (!snapshot)
             return '';
+        const { batchContext, confirmationSheet, confirmationData, confirmationHeader, senmuGate } = snapshot;
         const { ss, notifyBatchSheet, batchData, headerMap, row } = batchContext;
         const resolvedBatchId = batchContext.batchId;
         const tz = ss.getSpreadsheetTimeZone();
@@ -953,23 +932,16 @@ function sendHqReturnNotification(batchId) {
             uiAlertSafe('設定「本部長副本部長_通知先To」が未設定のため送信できません。');
             return resolvedBatchId;
         }
-        const confirmationSheetName = getCellValue(row, headerMap['確認用シート名']);
-        if (!confirmationSheetName)
-            return resolvedBatchId;
-        const confirmationSheet = ss.getSheetByName(confirmationSheetName);
         if (!confirmationSheet)
             return resolvedBatchId;
         ensureConfirmationSheetSchema(confirmationSheet);
-        const confirmationData = confirmationSheet.getDataRange().getValues();
         if (confirmationData.length <= 1)
             return resolvedBatchId;
-        const ch = getHeaderMap(confirmationData[0]);
+        const ch = confirmationHeader;
         const decisionIndex = ch['専務判断'];
         if (!decisionIndex)
             return resolvedBatchId;
         // 全行に専務判断が入力済みであることを確認（入力途中では発火しない）
-        let pending = 0;
-        let invalid = 0;
         const returnedRows = [];
         for (let i = 1; i < confirmationData.length; i++) {
             const cRow = confirmationData[i];
@@ -977,16 +949,8 @@ function sendHqReturnNotification(batchId) {
             if (!vehicleId)
                 continue;
             const decision = normalizeSenmuDecision(getCellValue(cRow, decisionIndex));
-            if (!decision) {
-                const raw = getCellValue(cRow, decisionIndex);
-                if (raw) {
-                    invalid += 1;
-                }
-                else {
-                    pending += 1;
-                }
+            if (!decision)
                 continue;
-            }
             if (decision === APPROVAL_INPUT.RETURN) {
                 returnedRows.push({
                     rowIndex: i,
@@ -997,8 +961,8 @@ function sendHqReturnNotification(batchId) {
             }
         }
         // 入力途中ガード
-        if (pending > 0 || invalid > 0) {
-            appendNotificationLog('差戻し通知', '', '', resolvedBatchId, `未入力(${pending})・不正(${invalid})ありのため未送信`);
+        if (senmuGate.pending > 0 || senmuGate.invalid > 0 || senmuGate.unchecked > 0) {
+            appendNotificationLog('差戻し通知', '', '', resolvedBatchId, `未入力(${senmuGate.pending})・不正(${senmuGate.invalid})・未確認(${senmuGate.unchecked})ありのため未送信`);
             return resolvedBatchId;
         }
         if (returnedRows.length === 0)
@@ -1064,21 +1028,24 @@ function sendHqReturnNotification(batchId) {
         row[headerMap['更新日時'] - 1] = now;
         notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
         appendNotificationLog('差戻し通知', '', hqTo, resolvedBatchId, `成功 差戻し${returnedRows.length}件`);
-        uiAlertSafe(`差戻し通知を送信しました。\n差戻し件数: ${returnedRows.length}\nbatchId: ${resolvedBatchId}`);
+        if (!(options === null || options === void 0 ? void 0 : options.suppressUi)) {
+            uiAlertSafe(`差戻し通知を送信しました。\n差戻し件数: ${returnedRows.length}\nbatchId: ${resolvedBatchId}`);
+        }
         return resolvedBatchId;
     }
     finally {
         lock.releaseLock();
     }
 }
-function sendMurataApprovalNotification(batchId) {
+function sendMurataApprovalNotification(batchId, options) {
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
     try {
         const settings = loadSettings();
-        const batchContext = getNotifyBatchContext(batchId);
-        if (!batchContext)
+        const snapshot = getBatchWorkflowSnapshot(batchId);
+        if (!snapshot)
             return '';
+        const { batchContext, confirmationSheet, confirmationData, confirmationHeader } = snapshot;
         const { ss, notifyBatchSheet, batchData, headerMap, row } = batchContext;
         const resolvedBatchId = batchContext.batchId;
         const tz = ss.getSpreadsheetTimeZone();
@@ -1098,14 +1065,8 @@ function sendMurataApprovalNotification(batchId) {
             uiAlertSafe('設定「村田主任_通知先To」が未設定のため送信できません。');
             return resolvedBatchId;
         }
-        const confirmationSheetName = getCellValue(row, headerMap['確認用シート名']);
-        if (!confirmationSheetName)
-            return resolvedBatchId;
-        const confirmationSheet = ss.getSheetByName(confirmationSheetName);
         if (!confirmationSheet)
             return resolvedBatchId;
-        const confirmationData = confirmationSheet.getDataRange().getValues();
-        const confirmationHeader = confirmationData.length > 0 ? getHeaderMap(confirmationData[0]) : {};
         const counts = summarizeConfirmationSheetRows(confirmationData, confirmationHeader);
         const batchLabel = getCellValue(row, headerMap['便区分']) || resolvedBatchId;
         const sheetUrl = buildSheetUrlWithGid(ss, confirmationSheet);
@@ -1139,7 +1100,9 @@ function sendMurataApprovalNotification(batchId) {
             row[headerMap['更新日時'] - 1] = now;
             notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
             appendNotificationLog('村田主任通知', '', murataTo, resolvedBatchId, '成功');
-            uiAlertSafe(`村田主任へ通知を送信しました。\nbatchId: ${resolvedBatchId}`);
+            if (!(options === null || options === void 0 ? void 0 : options.suppressUi)) {
+                uiAlertSafe(`村田主任へ通知を送信しました。\nbatchId: ${resolvedBatchId}`);
+            }
         }
         catch (err) {
             appendNotificationLog('村田主任通知', '', murataTo, resolvedBatchId, `失敗: ${err}`);
@@ -1390,38 +1353,8 @@ function runAutoAdvanceNow() {
     return advanceBiannualWorkflow('', 'manual');
 }
 function onEditAutoAdvance(e) {
-    const settings = loadSettings();
-    if (!settings.autoAdvanceEnabled || !settings.autoAdvanceOnEditEnabled)
-        return '';
-    if (!e || !e.range)
-        return '';
-    const range = e.range;
-    const sheet = range.getSheet();
-    if (!sheet)
-        return '';
-    const sheetName = sheet.getName();
-    if (!isConfirmationSheetName(sheetName))
-        return '';
-    if (range.getRow() <= 1)
-        return '';
-    const lastColumn = sheet.getLastColumn();
-    if (lastColumn <= 0)
-        return '';
-    const headerValues = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
-    const headerMap = getHeaderMap(headerValues);
-    if (!rangeTouchesHeaders(range, headerMap, AUTO_ADVANCE_EDIT_WATCH_HEADERS))
-        return '';
-    // 本部回答の再入力時に差戻し行の専務列を自動クリア
-    if (rangeTouchesHeaders(range, headerMap, ['本部回答'])) {
-        const batchIdForClear = resolveBatchIdFromConfirmationEdit(sheet, range.getRow(), headerMap);
-        const ctx = getNotifyBatchContext(batchIdForClear);
-        if (ctx) {
-            const status = getCellValue(ctx.row, ctx.headerMap['ステータス']);
-            clearReturnedSenmuStateOnReAnswer(sheet, range, headerMap, status);
-        }
-    }
-    const batchId = resolveBatchIdFromConfirmationEdit(sheet, range.getRow(), headerMap);
-    return advanceBiannualWorkflow(batchId, 'onEdit');
+    // 承認フローは編集途中の断片ではなく、定期実行で状態確定後に進める。
+    return '';
 }
 function onEditSourceSync(e) {
     if (!e || !e.range)
@@ -1486,29 +1419,50 @@ function advanceBiannualWorkflow(batchId, reason) {
         if (!confirmationSheetName || !ctx.ss.getSheetByName(confirmationSheetName)) {
             buildConfirmationSheet(targetBatchId);
         }
-        const afterBuildContext = getNotifyBatchContext(targetBatchId) || ctx;
-        const initialSentAt = parseDateValue(getCellRaw(afterBuildContext.row, afterBuildContext.headerMap['初回通知送信日時']));
-        if (!initialSentAt) {
+        let phase = evaluateBatchPhase(targetBatchId);
+        if (!phase)
+            return targetBatchId;
+        if (phase.phase === BATCH_PHASE.COMPLETED)
+            return targetBatchId;
+        if (phase.phase === BATCH_PHASE.INITIAL_PENDING) {
             sendHqInitialEmail(targetBatchId);
+            phase = evaluateBatchPhase(targetBatchId);
+            if (!phase)
+                return targetBatchId;
+            if (phase.phase === BATCH_PHASE.COMPLETED)
+                return targetBatchId;
         }
         sendHqReminderIfNeeded(targetBatchId);
-        sendSenmuApprovalRequestIfReady(targetBatchId);
-        if (settings.autoApplySenmuDecision && shouldRunAutoSenmuDecision(targetBatchId)) {
-            applySenmuDecisionFromSheet(targetBatchId);
+        if (phase.phase === BATCH_PHASE.SENMU_REQUEST_READY) {
+            sendSenmuApprovalRequestIfReady(targetBatchId);
+            phase = evaluateBatchPhase(targetBatchId);
+            if (!phase)
+                return targetBatchId;
+            if (phase.phase === BATCH_PHASE.COMPLETED)
+                return targetBatchId;
         }
-        // 専務判断後の分岐
-        const postCtx = getNotifyBatchContext(targetBatchId);
-        if (postCtx) {
-            const postStatus = getCellValue(postCtx.row, postCtx.headerMap['ステータス']);
-            if (postStatus === BIANNUAL_BATCH_STATUS.SENMU_RETURNED) {
-                sendHqReturnNotification(targetBatchId); // pending>0なら内部で早期リターン
-                return targetBatchId; // SENMU_RETURNED中はマスター反映しない
-            }
-            if (postStatus === BIANNUAL_BATCH_STATUS.SENMU_APPROVED) {
-                sendMurataApprovalNotification(targetBatchId);
-            }
+        const suppressUi = reason === 'timer';
+        if (settings.autoApplySenmuDecision && shouldRunAutoSenmuDecision(targetBatchId, phase)) {
+            applySenmuDecisionFromSheet(targetBatchId, { suppressUi });
+            phase = evaluateBatchPhase(targetBatchId);
+            if (!phase)
+                return targetBatchId;
+            if (phase.phase === BATCH_PHASE.COMPLETED)
+                return targetBatchId;
         }
-        if (settings.autoApplyMasterUpdates && shouldRunAutoMasterUpdate(targetBatchId)) {
+        if (phase.phase === BATCH_PHASE.SENMU_RETURN_READY) {
+            sendHqReturnNotification(targetBatchId, { suppressUi });
+            return targetBatchId;
+        }
+        if (phase.phase === BATCH_PHASE.MURATA_NOTIFY_READY) {
+            sendMurataApprovalNotification(targetBatchId, { suppressUi });
+            phase = evaluateBatchPhase(targetBatchId);
+            if (!phase)
+                return targetBatchId;
+            if (phase.phase === BATCH_PHASE.COMPLETED)
+                return targetBatchId;
+        }
+        if (settings.autoApplyMasterUpdates && shouldRunAutoMasterUpdate(targetBatchId, phase)) {
             applyMasterUpdates(targetBatchId);
         }
     }
@@ -1539,13 +1493,32 @@ function seedSettings() {
     }
     const rows = [];
     Object.keys(SETTINGS_DEFAULTS).forEach((key) => {
+        if (key === '自動進行_定期実行_間隔分')
+            return;
         if (!existingKeys[key]) {
             rows.push([key, SETTINGS_DEFAULTS[key], '']);
         }
     });
+    if (!existingKeys['自動進行_定期実行_間隔分']) {
+        const legacyHours = valuesFromSettingsSheet(data, headerMap, '自動進行_定期実行_間隔時間');
+        const intervalMinutes = normalizeAutoAdvanceIntervalMinutes(convertLegacyAutoAdvanceHours(legacyHours), Number(SETTINGS_DEFAULTS['自動進行_定期実行_間隔分']));
+        rows.push(['自動進行_定期実行_間隔分', intervalMinutes, '旧「自動進行_定期実行_間隔時間」から移行した分単位設定']);
+    }
     if (rows.length > 0) {
         sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, descIndex ? 3 : 2).setValues(rows);
     }
+}
+function valuesFromSettingsSheet(data, headerMap, key) {
+    const keyIndex = headerMap['設定項目'];
+    const valueIndex = headerMap['値'];
+    if (!keyIndex || !valueIndex)
+        return '';
+    for (let i = 1; i < data.length; i++) {
+        if (getCellValue(data[i], keyIndex) === key) {
+            return getCellRaw(data[i], valueIndex);
+        }
+    }
+    return '';
 }
 function exportTestResults(limit) {
     const ss = getSpreadsheet();
@@ -1962,15 +1935,11 @@ function installDailyTriggers() {
         ScriptApp.newTrigger('runBiannualSchedule').timeBased().at(triggerAt).create();
     });
     if (settings.autoAdvanceEnabled && settings.autoAdvanceTimerEnabled) {
-        const intervalHours = Math.max(1, Math.min(23, Math.floor(settings.autoAdvanceTimerIntervalHours)));
-        ScriptApp.newTrigger('runAutoAdvance').timeBased().everyHours(intervalHours).create();
+        ScriptApp.newTrigger('runAutoAdvance').timeBased().everyMinutes(settings.autoAdvanceTimerIntervalMinutes).create();
     }
     ScriptApp.newTrigger('syncVehicles').timeBased().everyHours(1).create();
     ScriptApp.newTrigger('onEditSourceSync').forSpreadsheet(ss).onEdit().create();
     ScriptApp.newTrigger('onEditSettingsSync').forSpreadsheet(ss).onEdit().create();
-    if (settings.autoAdvanceEnabled && settings.autoAdvanceOnEditEnabled) {
-        ScriptApp.newTrigger('onEditAutoAdvance').forSpreadsheet(ss).onEdit().create();
-    }
 }
 // === helpers ===
 function getSpreadsheet() {
@@ -2311,44 +2280,211 @@ function getNotifyBatchContext(batchId) {
         batchId: resolvedBatchId,
     };
 }
-function shouldRunAutoSenmuDecision(batchId) {
-    const context = getNotifyBatchContext(batchId);
-    if (!context)
-        return false;
-    const status = getCellValue(context.row, context.headerMap['ステータス']);
-    if (status !== BIANNUAL_BATCH_STATUS.SENMU_REQUESTED &&
-        status !== BIANNUAL_BATCH_STATUS.SENMU_APPROVED &&
-        status !== BIANNUAL_BATCH_STATUS.SENMU_RETURNED) {
-        return false;
+function getBatchWorkflowSnapshot(batchId) {
+    const batchContext = getNotifyBatchContext(batchId);
+    if (!batchContext)
+        return null;
+    const confirmationSheetName = getCellValue(batchContext.row, batchContext.headerMap['確認用シート名']);
+    if (!confirmationSheetName) {
+        return {
+            batchContext,
+            confirmationSheet: null,
+            confirmationData: [],
+            confirmationHeader: {},
+            hqGate: createEmptyGateEvaluation(),
+            senmuGate: createEmptyGateEvaluation(),
+            murataGate: createEmptyGateEvaluation(),
+        };
     }
-    const confirmationSheetName = getCellValue(context.row, context.headerMap['確認用シート名']);
-    if (!confirmationSheetName)
-        return false;
-    const sheet = context.ss.getSheetByName(confirmationSheetName);
-    if (!sheet || sheet.getLastRow() <= 1)
-        return false;
-    const data = sheet.getDataRange().getValues();
-    const headerMap = getHeaderMap(data[0]);
-    const decisionCol = headerMap['専務判断'];
-    if (!decisionCol)
-        return false;
+    const confirmationSheet = batchContext.ss.getSheetByName(confirmationSheetName);
+    if (!confirmationSheet || confirmationSheet.getLastRow() <= 0) {
+        return {
+            batchContext,
+            confirmationSheet: confirmationSheet || null,
+            confirmationData: [],
+            confirmationHeader: {},
+            hqGate: createEmptyGateEvaluation(),
+            senmuGate: createEmptyGateEvaluation(),
+            murataGate: createEmptyGateEvaluation(),
+        };
+    }
+    const confirmationData = confirmationSheet.getDataRange().getValues();
+    const confirmationHeader = confirmationData.length > 0 ? getHeaderMap(confirmationData[0]) : {};
+    return {
+        batchContext,
+        confirmationSheet,
+        confirmationData,
+        confirmationHeader,
+        hqGate: evaluateHqGate(confirmationData, confirmationHeader),
+        senmuGate: evaluateSenmuGate(confirmationData, confirmationHeader),
+        murataGate: evaluateMurataGate(confirmationData, confirmationHeader),
+    };
+}
+function createEmptyGateEvaluation() {
+    return {
+        total: 0,
+        completed: 0,
+        pending: 0,
+        invalid: 0,
+        unchecked: 0,
+        approved: 0,
+        returned: 0,
+        ready: false,
+        hasAnyInput: false,
+    };
+}
+function evaluateHqGate(data, headerMap) {
+    const result = createEmptyGateEvaluation();
+    if (!data || data.length <= 1)
+        return result;
     for (let i = 1; i < data.length; i++) {
         const row = data[i];
         const vehicleId = getCellValue(row, headerMap['vehicleId']);
         if (!vehicleId)
             continue;
-        const decision = normalizeSenmuDecision(getCellValue(row, decisionCol));
-        if (decision)
-            return true;
+        result.total += 1;
+        const answer = normalizeAnswerLabel(getCellValue(row, headerMap['本部回答']));
+        const checked = isCheckedCell(getCellRaw(row, headerMap['回答確認済み']));
+        if (answer)
+            result.hasAnyInput = true;
+        if (!answer)
+            result.pending += 1;
+        if (!checked)
+            result.unchecked += 1;
+        if (answer && checked)
+            result.completed += 1;
     }
-    return false;
+    result.ready = result.total > 0 && result.pending === 0 && result.unchecked === 0;
+    return result;
 }
-function shouldRunAutoMasterUpdate(batchId) {
-    const context = getNotifyBatchContext(batchId);
-    if (!context)
+function evaluateSenmuGate(data, headerMap) {
+    const result = createEmptyGateEvaluation();
+    if (!data || data.length <= 1)
+        return result;
+    for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        const vehicleId = getCellValue(row, headerMap['vehicleId']);
+        if (!vehicleId)
+            continue;
+        result.total += 1;
+        const rawDecision = getCellValue(row, headerMap['専務判断']);
+        const decision = normalizeSenmuDecision(rawDecision);
+        const checked = isCheckedCell(getCellRaw(row, headerMap['専務確認済み']));
+        if (rawDecision)
+            result.hasAnyInput = true;
+        if (!decision) {
+            if (rawDecision) {
+                result.invalid += 1;
+            }
+            else {
+                result.pending += 1;
+            }
+        }
+        else {
+            result.completed += 1;
+            if (decision === APPROVAL_INPUT.APPROVE)
+                result.approved += 1;
+            if (decision === APPROVAL_INPUT.RETURN)
+                result.returned += 1;
+        }
+        if (!checked)
+            result.unchecked += 1;
+    }
+    result.ready = result.total > 0 && result.pending === 0 && result.invalid === 0 && result.unchecked === 0;
+    return result;
+}
+function evaluateMurataGate(data, headerMap) {
+    const result = createEmptyGateEvaluation();
+    if (!data || data.length <= 1)
+        return result;
+    for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        const vehicleId = getCellValue(row, headerMap['vehicleId']);
+        if (!vehicleId)
+            continue;
+        const decision = normalizeSenmuDecision(getCellValue(row, headerMap['専務判断']));
+        if (decision !== APPROVAL_INPUT.APPROVE)
+            continue;
+        result.total += 1;
+        const checked = isCheckedCell(getCellRaw(row, headerMap['村田主任確認済み']));
+        const policy = normalizeAnswerLabel(getCellValue(row, headerMap['本部回答']));
+        const hasRequiredInputs = policy === ANSWER_LABELS.RENEW
+            ? !!parseDateValue(getCellRaw(row, headerMap['新契約開始日'])) && !!parseDateValue(getCellRaw(row, headerMap['新契約満了日']))
+            : !!policy && isCheckedCell(getCellRaw(row, headerMap['解約完了']));
+        if (checked)
+            result.hasAnyInput = true;
+        if (!checked)
+            result.unchecked += 1;
+        if (!hasRequiredInputs)
+            result.pending += 1;
+        if (checked && hasRequiredInputs)
+            result.completed += 1;
+    }
+    result.ready = result.total > 0 && result.pending === 0 && result.unchecked === 0;
+    return result;
+}
+function evaluateBatchPhase(batchId) {
+    const snapshot = getBatchWorkflowSnapshot(batchId);
+    if (!snapshot)
+        return null;
+    const { batchContext, confirmationSheet, hqGate, senmuGate, murataGate } = snapshot;
+    const { row, headerMap } = batchContext;
+    const status = getCellValue(row, headerMap['ステータス']);
+    const initialSentAt = parseDateValue(getCellRaw(row, headerMap['初回通知送信日時']));
+    const senmuRequestedAt = parseDateValue(getCellRaw(row, headerMap['専務依頼送信日時']));
+    const murataSentAt = parseDateValue(getCellRaw(row, headerMap['村田主任通知送信日時']));
+    let phase = BATCH_PHASE.HQ_WAITING;
+    if (!confirmationSheet || !initialSentAt) {
+        phase = BATCH_PHASE.INITIAL_PENDING;
+    }
+    else if (!hqGate.ready) {
+        phase = BATCH_PHASE.HQ_WAITING;
+    }
+    else if (!senmuRequestedAt) {
+        phase = BATCH_PHASE.SENMU_REQUEST_READY;
+    }
+    else if (!senmuGate.ready) {
+        phase = BATCH_PHASE.SENMU_WAITING;
+    }
+    else if (senmuGate.returned > 0 || status === BIANNUAL_BATCH_STATUS.SENMU_RETURNED) {
+        phase = BATCH_PHASE.SENMU_RETURN_READY;
+    }
+    else if (!murataSentAt) {
+        phase = BATCH_PHASE.MURATA_NOTIFY_READY;
+    }
+    else if (murataGate.ready || status === BIANNUAL_BATCH_STATUS.COMPLETED) {
+        phase = status === BIANNUAL_BATCH_STATUS.COMPLETED ? BATCH_PHASE.COMPLETED : BATCH_PHASE.MASTER_APPLY_READY;
+    }
+    else {
+        phase = BATCH_PHASE.MURATA_NOTIFY_READY;
+    }
+    return {
+        phase,
+        status,
+        hqGate,
+        senmuGate,
+        murataGate,
+        batchContext,
+    };
+}
+function shouldRunAutoSenmuDecision(batchId, phase) {
+    const evaluated = phase || evaluateBatchPhase(batchId);
+    if (!evaluated)
         return false;
-    const status = getCellValue(context.row, context.headerMap['ステータス']);
-    return status === BIANNUAL_BATCH_STATUS.SENMU_APPROVED;
+    if (evaluated.phase !== BATCH_PHASE.SENMU_WAITING &&
+        evaluated.phase !== BATCH_PHASE.SENMU_RETURN_READY &&
+        evaluated.phase !== BATCH_PHASE.MURATA_NOTIFY_READY &&
+        evaluated.phase !== BATCH_PHASE.MASTER_APPLY_READY &&
+        evaluated.phase !== BATCH_PHASE.COMPLETED) {
+        return false;
+    }
+    return evaluated.senmuGate.hasAnyInput || evaluated.senmuGate.ready;
+}
+function shouldRunAutoMasterUpdate(batchId, phase) {
+    const evaluated = phase || evaluateBatchPhase(batchId);
+    if (!evaluated)
+        return false;
+    return evaluated.phase === BATCH_PHASE.MASTER_APPLY_READY && evaluated.murataGate.total > 0;
 }
 function isConfirmationSheetName(sheetName) {
     return String(sheetName || '').startsWith(HQ_CONFIRMATION_SHEET_PREFIX);
@@ -2566,7 +2702,7 @@ function loadSettings() {
         reminderBeforeDays: toNumber(values['リマインド_期限前日数'], Number(SETTINGS_DEFAULTS['リマインド_期限前日数'])),
         autoAdvanceEnabled: toBoolean(values['自動進行_有効'], Boolean(SETTINGS_DEFAULTS['自動進行_有効'])),
         autoAdvanceTimerEnabled: toBoolean(values['自動進行_定期実行_有効'], Boolean(SETTINGS_DEFAULTS['自動進行_定期実行_有効'])),
-        autoAdvanceTimerIntervalHours: toNumber(values['自動進行_定期実行_間隔時間'], Number(SETTINGS_DEFAULTS['自動進行_定期実行_間隔時間'])),
+        autoAdvanceTimerIntervalMinutes: normalizeAutoAdvanceIntervalMinutes(values['自動進行_定期実行_間隔分'] || convertLegacyAutoAdvanceHours(values['自動進行_定期実行_間隔時間']), Number(SETTINGS_DEFAULTS['自動進行_定期実行_間隔分'])),
         autoAdvanceOnEditEnabled: toBoolean(values['自動進行_編集連動_有効'], Boolean(SETTINGS_DEFAULTS['自動進行_編集連動_有効'])),
         autoApplySenmuDecision: toBoolean(values['自動進行_専務判断反映_有効'], Boolean(SETTINGS_DEFAULTS['自動進行_専務判断反映_有効'])),
         autoApplyMasterUpdates: toBoolean(values['自動進行_マスター反映_有効'], Boolean(SETTINGS_DEFAULTS['自動進行_マスター反映_有効'])),
@@ -2575,6 +2711,27 @@ function loadSettings() {
         murataTo: toStringValue(values['村田主任_通知先To'], String(SETTINGS_DEFAULTS['村田主任_通知先To'])),
         murataCc: toStringValue(values['村田主任_通知先Cc'], String(SETTINGS_DEFAULTS['村田主任_通知先Cc'])),
     };
+}
+function convertLegacyAutoAdvanceHours(value) {
+    if (value === null || value === undefined || value === '')
+        return '';
+    const hours = Math.max(1, Math.floor(toNumber(value, 1)));
+    return hours * 60;
+}
+function normalizeAutoAdvanceIntervalMinutes(value, fallback) {
+    const desired = Math.max(1, Math.floor(toNumber(value, fallback)));
+    if (AUTO_ADVANCE_INTERVAL_MINUTES.indexOf(desired) >= 0)
+        return desired;
+    let nearest = AUTO_ADVANCE_INTERVAL_MINUTES[0];
+    let distance = Math.abs(desired - nearest);
+    AUTO_ADVANCE_INTERVAL_MINUTES.forEach((candidate) => {
+        const currentDistance = Math.abs(desired - candidate);
+        if (currentDistance < distance) {
+            nearest = candidate;
+            distance = currentDistance;
+        }
+    });
+    return nearest;
 }
 function toNumber(value, fallback) {
     if (value === null || value === undefined || value === '')
