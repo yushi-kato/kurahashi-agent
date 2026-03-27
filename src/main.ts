@@ -963,11 +963,18 @@ function applySenmuDecisionFromSheet(batchId?: string) {
       return resolvedBatchId;
     }
 
-    if (returned > 0) {
-      row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_RETURNED;
-    } else if (approved > 0) {
-      row[headerMap['ステータス'] - 1] = BIANNUAL_BATCH_STATUS.SENMU_APPROVED;
+    const newStatus = returned > 0
+      ? BIANNUAL_BATCH_STATUS.SENMU_RETURNED
+      : approved > 0
+        ? BIANNUAL_BATCH_STATUS.SENMU_APPROVED
+        : currentStatus;
+
+    // ステータスに変化がなければ no-op（ログ・モーダル・更新日時すべてスキップ）
+    if (newStatus === currentStatus) {
+      return resolvedBatchId;
     }
+
+    row[headerMap['ステータス'] - 1] = newStatus;
     row[headerMap['更新日時'] - 1] = now;
     notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
 
