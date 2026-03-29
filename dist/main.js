@@ -175,14 +175,6 @@ function onOpen() {
         .addItem('テスト手順書（このシートで見る）', 'showTestGuide')
         .addItem('新しい確認依頼を開始（対象抽出〜初回通知）', 'runDaily')
         .addItem('進行中の確認依頼を再開（最新）', 'runAutoAdvanceNow')
-        .addSubMenu(ui.createMenu('管理・設定')
-        .addItem('スキーマ同期', 'syncSchema')
-        .addItem('スキーマドリフト確認', 'checkSchemaDrift')
-        .addItem('設定ひな形作成', 'seedSettings')
-        .addItem('半期トリガー再作成', 'installDailyTriggers'))
-        .addSubMenu(ui.createMenu('テスト・保守')
-        .addItem('テスト一括実行(メール送信は設定次第)', 'runTestSuite')
-        .addItem('テストデータ掃除', 'cleanupTestData'))
         .addToUi();
 }
 function showOperationManual() {
@@ -1135,6 +1127,28 @@ function buildMasterApplyNotificationLine(entry, includeReasons) {
     }
     return parts.join(' | ');
 }
+function buildMasterAppliedDetailLine(entry) {
+    const parts = [buildMasterApplyNotificationLine(entry, false)];
+    parts.push(`確認用シート${entry.confirmationRowNumber}行目 → ${PRIMARY_SOURCE_SHEET}${entry.vehicleRowNumber}行目`);
+    if (entry.appliedDetails.length > 0) {
+        parts.push(`反映内容: ${entry.appliedDetails.join(' / ')}`);
+    }
+    return parts.join(' | ');
+}
+function buildMasterAppliedMailBlock(entry, index) {
+    const lines = [
+        `${index}. ${entry.registration || entry.vehicleId || '車両不明'} (${entry.policy || '方針未設定'})`,
+        `   確認元: 確認用シート ${entry.confirmationRowNumber}行目`,
+        `   反映先: ${PRIMARY_SOURCE_SHEET} ${entry.vehicleRowNumber}行目`,
+    ];
+    if (entry.appliedDetails.length > 0) {
+        lines.push('   反映内容:');
+        entry.appliedDetails.forEach((detail) => {
+            lines.push(`   - ${detail}`);
+        });
+    }
+    return lines.join('\n');
+}
 function createContentHash(lines) {
     const normalized = lines.join('\n');
     const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, normalized);
@@ -1225,8 +1239,9 @@ function notifyMurataMasterApplyCompleted(settings, batchContext, confirmationSh
         return false;
     const sorted = appliedEntries
         .slice()
-        .sort((a, b) => buildMasterApplyNotificationLine(a, false).localeCompare(buildMasterApplyNotificationLine(b, false), 'ja'));
-    const detailLines = sorted.map((entry) => `- ${buildMasterApplyNotificationLine(entry, false)}`);
+        .sort((a, b) => buildMasterAppliedDetailLine(a).localeCompare(buildMasterAppliedDetailLine(b), 'ja'));
+    const detailBlocks = sorted.map((entry, index) => buildMasterAppliedMailBlock(entry, index + 1));
+    const detailLines = detailBlocks.join('\n\n').split('\n');
     const nextHash = createContentHash(detailLines);
     const prevHash = String(getCellRaw(row, hashHeader) || '').trim();
     if (nextHash === prevHash) {
@@ -1251,9 +1266,10 @@ function notifyMurataMasterApplyCompleted(settings, batchContext, confirmationSh
         '村田主任',
         '',
         `${batchLabel} のマスター反映で、今回新たに完了した項目をお知らせします。`,
+        '「確認元」と「反映先」を分けているので、どの入力がどの台帳行に反映されたかをメール上で追えます。',
         '',
         '反映完了一覧:',
-        ...detailLines,
+        ...detailBlocks.flatMap((block) => block.split('\n').concat([''])).slice(0, -1),
         '',
         '確認用シート:',
         sheetUrl,
@@ -1395,6 +1411,9 @@ function applyMasterUpdates(batchId, options) {
             }
             skipped -= 1;
             const vehicleRow = vehicleData[vehicleRowIndex];
+            const confirmationRowNumber = i + 1;
+            const vehicleRowNumber = vehicleRowIndex + 1;
+            const appliedDetails = [];
             const setVehicle = (headerName, value) => {
                 const idx = vh[headerName];
                 if (idx)
@@ -1411,6 +1430,11 @@ function applyMasterUpdates(batchId, options) {
                 setVehicle('完了フラグ', true);
                 setVehicle('完了日', now);
                 setVehicle('完了メモ', '半期バッチで更新反映');
+                appliedDetails.push(`契約開始日=${formatDateLabel(newStart, tz)}`);
+                appliedDetails.push(`契約満了日=${formatDateLabel(newEnd, tz)}`);
+                appliedDetails.push('更新方針/一次回答/最終決定=更新');
+                appliedDetails.push('完了フラグ=TRUE');
+                appliedDetails.push('完了メモ=半期バッチで更新反映');
             }
             else {
                 setVehicle('更新方針', policy);
@@ -1420,6 +1444,10 @@ function applyMasterUpdates(batchId, options) {
                 setVehicle('完了日', now);
                 setVehicle('完了メモ', '半期バッチで解約反映');
                 rowIndexesToGray.push(vehicleRowIndex + 1);
+                appliedDetails.push(`更新方針/一次回答/最終決定=${policy}`);
+                appliedDetails.push('完了フラグ=TRUE');
+                appliedDetails.push('完了メモ=半期バッチで解約反映');
+                appliedDetails.push('車両一覧の対象行をグレーアウト');
             }
             setInvalidReason('');
             if (ch['反映日時'])
@@ -1431,6 +1459,9 @@ function applyMasterUpdates(batchId, options) {
                 vehicleId,
                 registration: validation.registration,
                 policy,
+                confirmationRowNumber,
+                vehicleRowNumber,
+                appliedDetails,
             });
         }
         if (modifiedVehicle) {

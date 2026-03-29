@@ -123,12 +123,13 @@
 <h2 id="5-初期セットアップ最初に1回だけ">5. 初期セットアップ（最初に1回だけ）</h2>
 <p>新しくこのシステムを使い始めるとき、運用管理者が次の手順を実行してください。</p>
 <ol>
-<li>メニュー → 管理・設定 →「<strong>設定ひな形作成</strong>」を実行</li>
+<li>「設定」シートを開き、必要な設定項目が並んでいることを確認する</li>
 <li>「設定」シートで通知先や締切日を入力する（→ <a href="#設定タブの項目">設定項目の一覧</a>）</li>
-<li>メニュー → 管理・設定 →「<strong>半期トリガー再作成</strong>」を実行</li>
+<li>保守担当者が <code>seedSettings()</code> と <code>installDailyTriggers()</code> を実行し、設定ひな形の不足補完とトリガー設定を行う</li>
 </ol>
 <p>これで自動進行の定期トリガーが設定され、リマインド送信・専務依頼送信・マスター反映などが自動で動くようになります。<br>
-ここでいう「定期」とは、入力の途中ではなく、数分おきに状態が落ち着いたところで進行可否を見直す、という意味です。</p>
+ここでいう「定期」とは、入力の途中ではなく、数分おきに状態が落ち着いたところで進行可否を見直す、という意味です。
+利用者向けメニューには保守項目を出していないため、ここでいう「保守担当者」はスクリプト実行権限を持つ管理者を指します。</p>
 <hr>
 <h2 id="6-やってはいけないこと">6. やってはいけないこと</h2>
 <ul>
@@ -199,7 +200,7 @@
 <tr><td><strong>村田主任反映完了通知送信</strong></td><td>今回の自動進行で新たにマスター反映できた行がある</td></tr>
 </tbody>
 </table>
-<p>トリガーが動いていない場合は、メニュー → 管理・設定 →「<strong>半期トリガー再作成</strong>」を実行してください。</p>
+<p>トリガーが動いていない場合は、保守担当者に <code>installDailyTriggers()</code> の再実行を依頼してください。</p>
 <hr>
 <h2 id="メニュー項目リファレンス">メニュー項目リファレンス</h2>
 <h3 id="トップメニュー">トップメニュー</h3>
@@ -207,26 +208,23 @@
 <thead><tr><th>メニュー項目</th><th>何をするか</th></tr></thead>
 <tbody>
 <tr><td><strong>運用マニュアル（このシートで見る）</strong></td><td>このマニュアルを表示</td></tr>
+<tr><td><strong>初期車両登録マニュアル（このシートで見る）</strong></td><td>初回の車両台帳準備手順を表示</td></tr>
+<tr><td><strong>テスト手順書（このシートで見る）</strong></td><td>テスト用の確認観点と手順を表示</td></tr>
 <tr><td><strong>新しい確認依頼を開始（対象抽出〜初回通知）</strong></td><td>新しい確認依頼を起こし、対象抽出・確認用シート生成・初回通知まで進める</td></tr>
 <tr><td><strong>進行中の確認依頼を再開（最新）</strong></td><td>進行中の最新の確認依頼を再評価し、進められるステップをすべて実行</td></tr>
 </tbody>
 </table>
-<h3 id="管理・設定">管理・設定</h3>
+<h3 id="保守担当者向けの非表示機能">保守担当者向けの非表示機能</h3>
+<p>利用者メニューには出していませんが、保守時には次の関数を使います。</p>
 <table>
-<thead><tr><th>メニュー項目</th><th>何をするか</th></tr></thead>
+<thead><tr><th>関数名</th><th>何をするか</th></tr></thead>
 <tbody>
-<tr><td><strong>スキーマ同期</strong></td><td>各シートのヘッダ列を最新定義に合わせる</td></tr>
-<tr><td><strong>スキーマドリフト確認</strong></td><td>ヘッダ列が想定通りか確認（変更なし）</td></tr>
-<tr><td><strong>設定ひな形作成</strong></td><td>「設定」シートに初期値を書き込む（初回のみ）</td></tr>
-<tr><td><strong>半期トリガー再作成</strong></td><td>自動進行のトリガーを再設定</td></tr>
-</tbody>
-</table>
-<h3 id="テスト・保守">テスト・保守</h3>
-<table>
-<thead><tr><th>メニュー項目</th><th>何をするか</th></tr></thead>
-<tbody>
-<tr><td><strong>テスト一括実行(メール送信は設定次第)</strong></td><td>E2Eテストを実行</td></tr>
-<tr><td><strong>テストデータ掃除</strong></td><td>TESTプレフィックスのデータを削除</td></tr>
+<tr><td><code>syncSchema()</code></td><td>各シートのヘッダ列を最新定義に合わせる</td></tr>
+<tr><td><code>checkSchemaDrift()</code></td><td>ヘッダやシートの不足を確認する</td></tr>
+<tr><td><code>seedSettings()</code></td><td>「設定」シートに初期値を書き込む（初回のみ）</td></tr>
+<tr><td><code>installDailyTriggers()</code></td><td>自動進行のトリガーを再設定する</td></tr>
+<tr><td><code>runTestSuite()</code></td><td>E2Eテストを実行する</td></tr>
+<tr><td><code>cleanupTestData()</code></td><td>TESTプレフィックスのデータを削除する</td></tr>
 </tbody>
 </table>
 

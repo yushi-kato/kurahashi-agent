@@ -72,14 +72,14 @@ Apps Script Execution API（`clasp run`）は返却値の型に制約がある�
 
 1) ローカルでビルド: `npm run build`
 2) GASへ反映: `clasp push -f`
-3) スプレッドシートでメニュー → **「テスト一括実行(メール送信は設定次第)」**
+3) `clasp run runTestSuite`
 4) `テスト結果` を確認（NGがあれば原因の項目へ）
 
 ### 3.3 テストデータの掃除
 
 台帳/統合ビュー/要入力/更新依頼/集計などに残った `TEST...` 系のテストデータを削除する。
 
-- スプレッドシートでメニュー → **「テストデータ掃除」**
+- `clasp run cleanupTestData`
 - CLIなら `clasp -u runscope run cleanupTestData`
 
 ### 3.2 期待する成果物（確認箇所）
