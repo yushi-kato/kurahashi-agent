@@ -1168,7 +1168,7 @@ function sendMurataApprovalNotification(batchId?: string, options?: { suppressUi
   }
 }
 
-function applyMasterUpdates(batchId?: string) {
+function applyMasterUpdates(batchId?: string, options?: { suppressUi?: boolean }) {
   const lock = LockService.getDocumentLock();
   lock.waitLock(30000);
   try {
@@ -1323,8 +1323,10 @@ function applyMasterUpdates(batchId?: string) {
     }
 
     if (allErrors.length > 0) {
-      const ui = SpreadsheetApp.getUi();
-      ui.alert('確認が必要な項目があります', allErrors.join('\n'), ui.ButtonSet.OK);
+      appendNotificationLog('マスター反映', '', '', resolvedBatchId, `要確認項目あり: ${allErrors.join(' | ')}`);
+      if (!options?.suppressUi) {
+        uiShowModalSafe('確認が必要な項目があります', allErrors.join('\n'));
+      }
     }
 
     if (modifiedVehicle) {
@@ -1353,16 +1355,18 @@ function applyMasterUpdates(batchId?: string) {
       resolvedBatchId,
       `反映:${applied} 待機:${waiting} 差戻し:${returned} スキップ:${skipped}`,
     );
-    uiShowModalSafe(
-      'マスター反映',
-      [
-        `batchId: ${resolvedBatchId}`,
-        `反映: ${applied}`,
-        `待機（専務未承認）: ${waiting}`,
-        `差戻し: ${returned}`,
-        `スキップ（入力不足・不整合）: ${skipped}`,
-      ].join('\n'),
-    );
+    if (!options?.suppressUi) {
+      uiShowModalSafe(
+        'マスター反映',
+        [
+          `batchId: ${resolvedBatchId}`,
+          `反映: ${applied}`,
+          `待機（専務未承認）: ${waiting}`,
+          `差戻し: ${returned}`,
+          `スキップ（入力不足・不整合）: ${skipped}`,
+        ].join('\n'),
+      );
+    }
 
     return resolvedBatchId;
   } finally {
@@ -1542,7 +1546,7 @@ function advanceBiannualWorkflow(batchId?: string, reason?: string) {
     }
 
     if (settings.autoApplyMasterUpdates && shouldRunAutoMasterUpdate(targetBatchId, phase)) {
-      applyMasterUpdates(targetBatchId);
+      applyMasterUpdates(targetBatchId, { suppressUi: reason === 'timer' });
     }
   } catch (err) {
     appendNotificationLog('自動進行', '', '', targetBatchId, `失敗(${reason || 'unknown'}): ${err}`);

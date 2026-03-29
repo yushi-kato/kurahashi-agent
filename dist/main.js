@@ -1085,7 +1085,7 @@ function sendMurataApprovalNotification(batchId, options) {
         lock.releaseLock();
     }
 }
-function applyMasterUpdates(batchId) {
+function applyMasterUpdates(batchId, options) {
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
     try {
@@ -1229,8 +1229,10 @@ function applyMasterUpdates(batchId) {
             modifiedConfirmation = true;
         }
         if (allErrors.length > 0) {
-            const ui = SpreadsheetApp.getUi();
-            ui.alert('確認が必要な項目があります', allErrors.join('\n'), ui.ButtonSet.OK);
+            appendNotificationLog('マスター反映', '', '', resolvedBatchId, `要確認項目あり: ${allErrors.join(' | ')}`);
+            if (!(options === null || options === void 0 ? void 0 : options.suppressUi)) {
+                uiShowModalSafe('確認が必要な項目があります', allErrors.join('\n'));
+            }
         }
         if (modifiedVehicle) {
             vehicleSheet.getRange(1, 1, vehicleData.length, vehicleData[0].length).setValues(vehicleData);
@@ -1251,13 +1253,15 @@ function applyMasterUpdates(batchId) {
         row[headerMap['更新日時'] - 1] = now;
         notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
         appendNotificationLog('マスター反映', '', '', resolvedBatchId, `反映:${applied} 待機:${waiting} 差戻し:${returned} スキップ:${skipped}`);
-        uiShowModalSafe('マスター反映', [
-            `batchId: ${resolvedBatchId}`,
-            `反映: ${applied}`,
-            `待機（専務未承認）: ${waiting}`,
-            `差戻し: ${returned}`,
-            `スキップ（入力不足・不整合）: ${skipped}`,
-        ].join('\n'));
+        if (!(options === null || options === void 0 ? void 0 : options.suppressUi)) {
+            uiShowModalSafe('マスター反映', [
+                `batchId: ${resolvedBatchId}`,
+                `反映: ${applied}`,
+                `待機（専務未承認）: ${waiting}`,
+                `差戻し: ${returned}`,
+                `スキップ（入力不足・不整合）: ${skipped}`,
+            ].join('\n'));
+        }
         return resolvedBatchId;
     }
     finally {
@@ -1435,7 +1439,7 @@ function advanceBiannualWorkflow(batchId, reason) {
                 return targetBatchId;
         }
         if (settings.autoApplyMasterUpdates && shouldRunAutoMasterUpdate(targetBatchId, phase)) {
-            applyMasterUpdates(targetBatchId);
+            applyMasterUpdates(targetBatchId, { suppressUi: reason === 'timer' });
         }
     }
     catch (err) {
