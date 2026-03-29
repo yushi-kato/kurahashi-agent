@@ -174,8 +174,7 @@ function onOpen() {
         .addItem('初期車両登録マニュアル（このシートで見る）', 'showInitialVehicleRegistrationManual')
         .addItem('テスト手順書（このシートで見る）', 'showTestGuide')
         .addItem('新しい確認依頼を開始（対象抽出〜初回通知）', 'runDaily')
-        .addSeparator()
-        .addSubMenu(ui.createMenu('途中再開・復旧').addItem('進行中の確認依頼を再開（最新）', 'runAutoAdvanceNow'))
+        .addItem('進行中の確認依頼を再開（最新）', 'runAutoAdvanceNow')
         .addSubMenu(ui.createMenu('管理・設定')
         .addItem('スキーマ同期', 'syncSchema')
         .addItem('スキーマドリフト確認', 'checkSchemaDrift')
@@ -2038,10 +2037,10 @@ function runTestSuite() {
     appendTestResult('期待値:通知バッチ通知列', hasMurataIssueHeaders ? 'OK' : 'NG', JSON.stringify({ headers: notifyBatchHeaders }));
     const onOpenSource = String(globalThis.onOpen || onOpen).replace(/\s+/g, ' ');
     const manualMenuSlimmed = onOpenSource.includes("addItem('新しい確認依頼を開始（対象抽出〜初回通知）', 'runDaily')") &&
-        onOpenSource.includes("addSubMenu(ui.createMenu('途中再開・復旧').addItem('進行中の確認依頼を再開（最新）', 'runAutoAdvanceNow'))") &&
+        onOpenSource.includes("addItem('進行中の確認依頼を再開（最新）', 'runAutoAdvanceNow')") &&
         !onOpenSource.includes('村田主任通知送信（最新バッチ）') &&
         !onOpenSource.includes('マスター反映（最新バッチ）');
-    appendTestResult('期待値:手動メニュー整理', manualMenuSlimmed ? 'OK' : 'NG', '開始と途中再開の2導線に整理');
+    appendTestResult('期待値:手動メニュー整理', manualMenuSlimmed ? 'OK' : 'NG', '開始と途中再開をトップレベルに整理');
     const legacyCheck = verifyAcceptanceCondition7LegacyNonReachable();
     appendTestResult('受け入れ条件7:旧導線非到達', legacyCheck.ok ? 'OK' : 'NG', JSON.stringify({
         remainingLegacyEntries: legacyCheck.remainingLegacyEntries,
