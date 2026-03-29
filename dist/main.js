@@ -593,24 +593,26 @@ function sendHqInitialEmail(batchId) {
         const deadline = parseDateValue(getCellRaw(row, headerMap['回答期限']));
         const targetStart = parseDateValue(getCellRaw(row, headerMap['対象開始日']));
         const targetEnd = parseDateValue(getCellRaw(row, headerMap['対象終了日']));
-        const subject = `【車両更新確認】${batchLabel} 一次確認のお願い`;
+        const subject = `【車両更新確認】${batchLabel} ご確認のお願い`;
         const body = [
             '本部長・副本部長 各位',
             '',
-            `${batchLabel} の車両更新確認をお願いします。`,
-            `batchId: ${resolvedBatchId}`,
+            `${batchLabel} の車両更新確認をお願いいたします。`,
+            '',
             `対象期間: ${formatDateLabel(targetStart || new Date(), tz)}〜${formatDateLabel(targetEnd || new Date(), tz)}`,
             `回答期限: ${formatDateLabel(deadline || new Date(), tz)}`,
-            '',
             `対象件数: ${counts.total}`,
-            `未回答件数: ${counts.unanswered}`,
+            '',
+            'ご対応の流れ:',
+            `1. 確認用シートを開き、「本部回答」を ${ANSWER_OPTIONS.join(' / ')} から選択する`,
+            '2. 全件の入力が終わったら、「回答確認済み」にチェックを入れる',
             '',
             '確認用シート:',
             sheetUrl,
             '',
-            '入力ルール:',
-            `- 「本部回答」は ${ANSWER_OPTIONS.join(' / ')} から選択してください。`,
-            '- 全件入力後に「回答確認済み」をチェックしてください。',
+            `管理番号: ${resolvedBatchId}`,
+            '',
+            'よろしくお願いいたします。',
         ].join('\n');
         try {
             MailApp.sendEmail({
@@ -689,21 +691,24 @@ function sendHqReminderIfNeeded(batchId) {
         }
         const batchLabel = getCellValue(row, headerMap['便区分']) || resolvedBatchId;
         const sheetUrl = buildSheetUrlWithGid(ss, confirmationSheet);
-        const subject = `【リマインド】${batchLabel} 回答確認のお願い`;
+        const subject = `【リマインド】${batchLabel} ご確認のお願い`;
         const body = [
             '本部長・副本部長 各位',
             '',
-            `${batchLabel} の確認用シートで、未確認行が残っています。`,
-            `batchId: ${resolvedBatchId}`,
+            `${batchLabel} の確認について、未完了の項目が残っています。`,
             `回答期限: ${formatDateLabel(deadline, tz)}`,
             '',
             `未確認件数: ${counts.unchecked}`,
             `未回答件数: ${counts.unanswered}`,
             '',
+            'お手すきの際に確認用シートをご確認いただき、全件入力後に「回答確認済み」へチェックをお願いいたします。',
+            '',
             '確認用シート:',
             sheetUrl,
             '',
-            '※本メールは「期限前リマインド」の1回送信です。',
+            `管理番号: ${resolvedBatchId}`,
+            '',
+            '※ このメールは期限前のご案内として1回のみ送信しています。',
         ].join('\n');
         try {
             MailApp.sendEmail({
@@ -774,24 +779,28 @@ function sendSenmuApprovalRequestIfReady(batchId) {
         const batchLabel = getCellValue(row, headerMap['便区分']) || resolvedBatchId;
         const deadline = parseDateValue(getCellRaw(row, headerMap['回答期限']));
         const sheetUrl = buildSheetUrlWithGid(ss, confirmationSheet);
-        const subject = `【専務確認依頼】${batchLabel} 車両更新方針`;
+        const subject = `【専務確認依頼】${batchLabel} ご確認のお願い`;
         const body = [
             '専務',
             '',
-            `${batchLabel} の一次確認が完了しました。`,
-            `batchId: ${resolvedBatchId}`,
-            `回答期限: ${formatDateLabel(deadline || new Date(), tz)}`,
+            `${batchLabel} の一次確認が完了しましたので、最終確認をお願いいたします。`,
             '',
             `対象件数: ${counts.total}`,
             `更新: ${counts.renew}`,
             `解約（入替）: ${counts.cancellationReplace}`,
             `解約（満了）: ${counts.cancellationEnd}`,
+            `確認期限の目安: ${formatDateLabel(deadline || new Date(), tz)}`,
             '',
-            '確認用シート（専務判断列を入力してください）:',
+            'ご対応の流れ:',
+            `1. 確認用シートの「専務判断」に ${APPROVAL_INPUT.APPROVE} または ${APPROVAL_INPUT.RETURN} を入力する`,
+            '2. 判断を入れた行ごとに「専務確認済み」へチェックを入れる',
+            '',
+            '確認用シート:',
             sheetUrl,
             '',
-            `専務判断の入力値: ${APPROVAL_INPUT.APPROVE} / ${APPROVAL_INPUT.RETURN}`,
-            '※ 全行の判断入力後、各行の「専務確認済み」にもチェックを入れてください。',
+            `管理番号: ${resolvedBatchId}`,
+            '',
+            'よろしくお願いいたします。',
         ].join('\n');
         try {
             MailApp.sendEmail({
@@ -940,23 +949,26 @@ function sendHqReturnNotification(batchId, options) {
             return resolvedBatchId;
         const batchLabel = getCellValue(row, headerMap['便区分']) || resolvedBatchId;
         const sheetUrl = buildSheetUrlWithGid(ss, confirmationSheet);
-        const subject = `【差戻し】${batchLabel} 再回答のお願い`;
+        const subject = `【差戻し】${batchLabel} 再確認のお願い`;
         const detailLines = returnedRows.map((r) => `- ${r.regNumber}${r.comment ? '（' + r.comment + '）' : ''}`);
         const body = [
             '本部長・副本部長 各位',
             '',
-            `${batchLabel} の専務確認で差戻しがありました。`,
-            `batchId: ${resolvedBatchId}`,
+            `${batchLabel} の専務確認で、再確認のご依頼が出ています。`,
             '',
             `差戻し件数: ${returnedRows.length}`,
             '',
-            '差戻し明細:',
+            '差戻し内容:',
             ...detailLines,
             '',
-            '上記について「本部回答」を再入力し、「回答確認済み」をチェックしてください。',
+            '該当行をご確認のうえ、必要に応じて「本部回答」を見直し、あらためて「回答確認済み」へチェックをお願いいたします。',
             '',
             '確認用シート:',
             sheetUrl,
+            '',
+            `管理番号: ${resolvedBatchId}`,
+            '',
+            'よろしくお願いいたします。',
         ].join('\n');
         try {
             MailApp.sendEmail({
@@ -1041,22 +1053,26 @@ function sendMurataApprovalNotification(batchId, options) {
         const counts = summarizeConfirmationSheetRows(confirmationData, confirmationHeader);
         const batchLabel = getCellValue(row, headerMap['便区分']) || resolvedBatchId;
         const sheetUrl = buildSheetUrlWithGid(ss, confirmationSheet);
-        const subject = `【マスター反映依頼】${batchLabel} 専務承認完了`;
+        const subject = `【マスター反映前確認】${batchLabel} 専務承認完了`;
         const body = [
             '村田主任',
             '',
             `${batchLabel} の専務確認が全件承認されました。`,
-            `batchId: ${resolvedBatchId}`,
             '',
             `対象件数: ${counts.total}`,
             `更新: ${counts.renew}`,
             `解約（入替）: ${counts.cancellationReplace}`,
             `解約（満了）: ${counts.cancellationEnd}`,
             '',
-            '確認用シートで「村田主任確認済み」をチェック後、マスター反映を実行してください。',
+            '確認用シートで内容をご確認のうえ、反映対象の行に「村田主任確認済み」へチェックをお願いいたします。',
+            'チェックがそろった行から、定期実行の自動処理で順次マスターへ反映されます。',
             '',
             '確認用シート:',
             sheetUrl,
+            '',
+            `管理番号: ${resolvedBatchId}`,
+            '',
+            'よろしくお願いいたします。',
         ].join('\n');
         try {
             MailApp.sendEmail({
