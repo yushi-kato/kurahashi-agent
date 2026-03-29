@@ -880,7 +880,7 @@ function sendSenmuApprovalRequestIfReady(batchId?: string) {
   }
 }
 
-function applySenmuDecisionFromSheet(batchId?: string, options?: { suppressUi?: boolean }) {
+function applySenmuDecisionFromSheet(batchId?: string) {
   const lock = LockService.getDocumentLock();
   lock.waitLock(30000);
   try {
@@ -900,23 +900,6 @@ function applySenmuDecisionFromSheet(batchId?: string, options?: { suppressUi?: 
     const h = confirmationHeader;
     const decisionIndex = h['専務判断'];
     if (!decisionIndex) return resolvedBatchId;
-    const senmuCheckIndex = h['専務確認済み'];
-
-    const invalidRows: string[] = [];
-
-    for (let i = 1; i < confirmationData.length; i++) {
-      const rowData = confirmationData[i];
-      const vehicleId = getCellValue(rowData, h['vehicleId']);
-      if (!vehicleId) continue;
-      const decision = normalizeSenmuDecision(getCellValue(rowData, decisionIndex));
-      if (!decision) {
-        const raw = getCellValue(rowData, decisionIndex);
-        if (raw) {
-          invalidRows.push(`行${i + 1}: ${raw}`);
-        }
-        continue;
-      }
-    }
 
     const now = new Date();
     const currentStatus = getCellValue(row, headerMap['ステータス']);
@@ -965,19 +948,6 @@ function applySenmuDecisionFromSheet(batchId?: string, options?: { suppressUi?: 
       `承認:${senmuGate.approved} 差戻し:${senmuGate.returned} 保留:${senmuGate.pending} 不正:${senmuGate.invalid}`,
     );
 
-    const lines = [
-      `batchId: ${resolvedBatchId}`,
-      `承認: ${senmuGate.approved}`,
-      `差戻し: ${senmuGate.returned}`,
-      `保留: ${senmuGate.pending}`,
-      `不正入力: ${senmuGate.invalid}`,
-    ];
-    if (invalidRows.length > 0) {
-      lines.push('', '不正入力明細:', ...invalidRows.slice(0, 10));
-    }
-    if (!options?.suppressUi) {
-      uiShowModalSafe('専務判断反映', lines.join('\n'));
-    }
     return resolvedBatchId;
   } finally {
     lock.releaseLock();
@@ -1086,12 +1056,12 @@ function sendHqReturnNotification(batchId?: string, options?: { suppressUi?: boo
       throw err;
     }
 
-    // 差戻し行のHQ側列のみクリア（専務判断・専務コメント・専務確認済みはフィードバックとして残す）
+    // 差戻しは「回答の破棄」ではなく「再確認依頼」なので、本部回答は残しつつ再確認フラグだけ戻す。
     let modified = false;
     for (const r of returnedRows) {
       const cRow = confirmationData[r.rowIndex];
-      if (ch['本部回答']) cRow[ch['本部回答'] - 1] = '';
       if (ch['回答確認済み']) cRow[ch['回答確認済み'] - 1] = false;
+      if (ch['専務確認済み']) cRow[ch['専務確認済み'] - 1] = false;
       if (ch['村田主任確認済み']) cRow[ch['村田主任確認済み'] - 1] = false;
       if (ch['反映日時']) cRow[ch['反映日時'] - 1] = '';
       modified = true;
@@ -1551,19 +1521,20 @@ function advanceBiannualWorkflow(batchId?: string, reason?: string) {
       if (phase.phase === BATCH_PHASE.COMPLETED) return targetBatchId;
     }
 
-    const suppressUi = reason === 'timer';
     if (settings.autoApplySenmuDecision && shouldRunAutoSenmuDecision(targetBatchId, phase)) {
-      applySenmuDecisionFromSheet(targetBatchId, { suppressUi });
+      applySenmuDecisionFromSheet(targetBatchId);
       phase = evaluateBatchPhase(targetBatchId);
       if (!phase) return targetBatchId;
       if (phase.phase === BATCH_PHASE.COMPLETED) return targetBatchId;
     }
 
     if (phase.phase === BATCH_PHASE.SENMU_RETURN_READY) {
+      const suppressUi = reason === 'timer';
       sendHqReturnNotification(targetBatchId, { suppressUi });
       return targetBatchId;
     }
     if (phase.phase === BATCH_PHASE.MURATA_NOTIFY_READY) {
+      const suppressUi = reason === 'timer';
       sendMurataApprovalNotification(targetBatchId, { suppressUi });
       phase = evaluateBatchPhase(targetBatchId);
       if (!phase) return targetBatchId;
