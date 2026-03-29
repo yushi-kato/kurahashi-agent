@@ -151,10 +151,8 @@ const SETTINGS_DEFAULTS: { [key: string]: string | number | boolean } = {
   本部長副本部長_通知先To: '',
   専務_通知先To: '',
   専務_通知先Cc: '',
-  半期送付日_3月: '03-01',
-  半期送付日_9月: '09-01',
-  回答期限_3月: '03-31',
-  回答期限_9月: '09-30',
+  期間Aの開始月: 3,
+  期間Bの開始月: 9,
   リマインド_期限前日数: 10,
   自動進行_有効: true,
   自動進行_定期実行_有効: true,
@@ -403,10 +401,9 @@ function createBiannualBatch(options?: { suppressUi?: boolean }) {
     }
 
     const vehicleContext = loadSourceVehicleContext();
-    const targetVehicles = pickVehiclesByContractEndRange(
+    const targetVehicles = pickVehiclesBeforeContractEndDate(
       vehicleContext.rows,
       vehicleContext.headerMap,
-      batchDef.targetStart,
       batchDef.targetEnd,
       tz,
     );
@@ -421,7 +418,7 @@ function createBiannualBatch(options?: { suppressUi?: boolean }) {
     setCell('便区分', batchDef.label);
     setCell('送付予定日', batchDef.sendDate);
     setCell('回答期限', batchDef.deadline);
-    setCell('対象開始日', batchDef.targetStart);
+    setCell('対象開始日', '');
     setCell('対象終了日', batchDef.targetEnd);
     setCell('対象件数', targetVehicles.length);
     setCell('確認用シート名', '');
@@ -438,7 +435,8 @@ function createBiannualBatch(options?: { suppressUi?: boolean }) {
       uiAlertSafe(
         `半期バッチを起票しました。\n` +
           `batchId: ${batchDef.batchId}\n` +
-          `対象期間: ${formatDateLabel(batchDef.targetStart, tz)}〜${formatDateLabel(batchDef.targetEnd, tz)}\n` +
+          `基準日: ${formatDateLabel(batchDef.targetEnd, tz)} より前に満了する車両を抽出\n` +
+          `回答期限: ${formatDateLabel(batchDef.deadline, tz)}\n` +
           `対象件数: ${targetVehicles.length}件\n` +
           `確認用シート: ${confirmationSheetName}`,
       );
@@ -498,14 +496,13 @@ function buildConfirmationSheet(batchId: string) {
   if (!batchRowInfo) throw new Error(`通知バッチが見つかりません: ${batchId}`);
 
   const batchRow = batchRowInfo.row;
-  const targetStart = parseDateValue(getCellRaw(batchRow, batchHeader['対象開始日']));
   const targetEnd = parseDateValue(getCellRaw(batchRow, batchHeader['対象終了日']));
-  if (!targetStart || !targetEnd) {
-    throw new Error(`通知バッチの対象期間が不正です: ${batchId}`);
+  if (!targetEnd) {
+    throw new Error(`通知バッチの基準日が不正です: ${batchId}`);
   }
 
   const vehicleContext = loadSourceVehicleContext();
-  const targetVehicles = pickVehiclesByContractEndRange(vehicleContext.rows, vehicleContext.headerMap, targetStart, targetEnd, tz);
+  const targetVehicles = pickVehiclesBeforeContractEndDate(vehicleContext.rows, vehicleContext.headerMap, targetEnd, tz);
 
   const sendDate = parseDateValue(getCellRaw(batchRow, batchHeader['送付予定日'])) || new Date();
   const sheetStamp = Utilities.formatDate(sendDate, tz, 'yyyyMMdd');
@@ -629,7 +626,6 @@ function sendHqInitialEmail(batchId?: string, options?: { suppressUi?: boolean }
     const sheetUrl = buildSheetUrlWithGid(ss, confirmationSheet);
     const batchLabel = getCellValue(row, headerMap['便区分']) || resolvedBatchId;
     const deadline = parseDateValue(getCellRaw(row, headerMap['回答期限']));
-    const targetStart = parseDateValue(getCellRaw(row, headerMap['対象開始日']));
     const targetEnd = parseDateValue(getCellRaw(row, headerMap['対象終了日']));
 
     const subject = `【車両更新確認】${batchLabel} ご確認のお願い`;
@@ -638,7 +634,7 @@ function sendHqInitialEmail(batchId?: string, options?: { suppressUi?: boolean }
       '',
       `${batchLabel} の車両更新確認をお願いいたします。`,
       '',
-      `対象期間: ${formatDateLabel(targetStart || new Date(), tz)}〜${formatDateLabel(targetEnd || new Date(), tz)}`,
+      `抽出条件: 基準日 ${formatDateLabel(targetEnd || new Date(), tz)} より前に満了する車両`,
       `回答期限: ${formatDateLabel(deadline || new Date(), tz)}`,
       `対象件数: ${counts.total}`,
       '',
@@ -1885,15 +1881,25 @@ function seedSettings() {
 function prepareManualStartLaunchDiagnosis() {
   syncSchema();
   syncVehicles();
-  installDailyTriggers();
+  try {
+    installDailyTriggers();
+  } catch (err) {
+    return buildStartLaunchErrorDiagnosis(START_LAUNCH_DIAG_MODE.MANUAL, err);
+  }
   return diagnoseStartLaunch(START_LAUNCH_DIAG_MODE.MANUAL);
 }
 
 function diagnoseStartLaunch(mode: (typeof START_LAUNCH_DIAG_MODE)[keyof typeof START_LAUNCH_DIAG_MODE]) {
   const ss = getSpreadsheet();
   const tz = ss.getSpreadsheetTimeZone();
-  const settings = loadSettings();
-  const batchDef = resolveBiannualBatchDefinition(new Date(), tz, settings);
+  let settings: ReturnType<typeof loadSettings>;
+  let batchDef: ReturnType<typeof resolveBiannualBatchDefinition>;
+  try {
+    settings = loadSettings();
+    batchDef = resolveBiannualBatchDefinition(new Date(), tz, settings);
+  } catch (err) {
+    return buildStartLaunchErrorDiagnosis(mode, err);
+  }
   const schemaDriftMessages = checkSchemaDrift();
   const missingSettingLabels = START_REQUIRED_SETTING_LABELS.filter(({ key }) => !String((settings as any)[key] || '').trim()).map(
     ({ label }) => label,
@@ -2128,8 +2134,29 @@ function notifyScheduledStartBlocked(diagnosis: ReturnType<typeof diagnoseStartL
 }
 
 function clearScheduledStartBlockedNotice(batchId: string) {
+  if (!batchId) return;
   const props = PropertiesService.getDocumentProperties();
   props.deleteProperty(`${PROP_KEYS.AUTO_START_BLOCK_NOTICE_PREFIX}${batchId}`);
+}
+
+function buildStartLaunchErrorDiagnosis(
+  mode: (typeof START_LAUNCH_DIAG_MODE)[keyof typeof START_LAUNCH_DIAG_MODE],
+  err: any,
+) {
+  return {
+    status: START_LAUNCH_STATUS.BLOCKED,
+    mode,
+    batchId: '',
+    batchLabel: '期間便',
+    blockingMessages: [String(err && err.message ? err.message : err)],
+    warningMessages: [],
+    missingSettingLabels: [],
+    needsInputSummary: { count: 0, reasonCounts: [] as Array<{ reason: string; count: number }> },
+    schemaDriftMessages: [],
+    existingBatch: null,
+    mailSendEnabled: false,
+    preparedSteps: ['スキーマ同期済み', '車両同期済み'],
+  };
 }
 
 function buildStartLaunchTitle(diagnosis: ReturnType<typeof diagnoseStartLaunch>) {
@@ -2669,20 +2696,16 @@ function installDailyTriggers() {
   const runDates: Date[] = [];
 
   years.forEach((year) => {
-    const marchSendDate = resolveMonthDaySettingDate(settings.marchSendDate, year, 3, 1, tz);
-    const septemberSendDate = resolveMonthDaySettingDate(settings.septemberSendDate, year, 9, 1, tz);
-    const marchDeadline = resolveMonthDaySettingDate(settings.marchDeadline, year, 3, 31, tz);
-    const septemberDeadline = resolveMonthDaySettingDate(settings.septemberDeadline, year, 9, 30, tz);
-    const marchReminder = addDays(marchDeadline, -reminderBeforeDays);
-    const septemberReminder = addDays(septemberDeadline, -reminderBeforeDays);
-
-    [marchSendDate, septemberSendDate, marchReminder, septemberReminder].forEach((d) => {
-      const date = toDateOnly(d, tz);
-      if (date.getTime() < now.getTime()) return;
-      const key = Utilities.formatDate(date, tz, 'yyyy-MM-dd');
-      if (dateKeys[key]) return;
-      dateKeys[key] = true;
-      runDates.push(date);
+    resolveConfiguredPeriods(year, settings, tz).forEach((period) => {
+      const reminderDate = addDays(period.deadline, -reminderBeforeDays);
+      [period.baseDate, reminderDate].forEach((d) => {
+        const date = toDateOnly(d, tz);
+        if (date.getTime() < now.getTime()) return;
+        const key = Utilities.formatDate(date, tz, 'yyyy-MM-dd');
+        if (dateKeys[key]) return;
+        dateKeys[key] = true;
+        runDates.push(date);
+      });
     });
   });
 
@@ -2933,78 +2956,60 @@ function addDays(date: Date, days: number) {
   return d;
 }
 
-function isWithinRange(date: Date, start: Date, end: Date) {
-  return date.getTime() >= start.getTime() && date.getTime() <= end.getTime();
-}
-
 function resolveBiannualBatchDefinition(referenceDate: Date, tz: string, settings: ReturnType<typeof loadSettings>) {
-  const month = referenceDate.getMonth() + 1;
-  const year = referenceDate.getFullYear();
-  const isH1 = month <= 3 || month >= 10;
+  const reference = toDateOnly(referenceDate, tz);
+  const currentYear = reference.getFullYear();
+  const periods = [...resolveConfiguredPeriods(currentYear, settings, tz), ...resolveConfiguredPeriods(currentYear + 1, settings, tz)];
+  const upcoming =
+    periods.find((period) => period.baseDate.getTime() > reference.getTime()) ||
+    buildConfiguredPeriodDefinition(currentYear + 1, 'A', '期間A便', settings.periodAStartMonth, tz);
 
-  if (isH1) {
-    const batchYear = month >= 10 ? year + 1 : year;
-    const rangeStartYear = batchYear - 1;
-    const targetStart = toDateOnly(new Date(rangeStartYear, 9, 1), tz);
-    const targetEnd = toDateOnly(new Date(batchYear, 2, 31), tz);
-    const sendDate = resolveMonthDaySettingDate(settings.marchSendDate, batchYear, 3, 1, tz);
-    const deadline = resolveMonthDaySettingDate(settings.marchDeadline, batchYear, 3, 31, tz);
-    return {
-      batchId: `${batchYear}H1`,
-      label: `${batchYear}年3月便`,
-      sendDate,
-      deadline,
-      targetStart,
-      targetEnd,
-    };
-  }
-
-  const batchYear = year;
-  const targetStart = toDateOnly(new Date(batchYear, 3, 1), tz);
-  const targetEnd = toDateOnly(new Date(batchYear, 8, 30), tz);
-  const sendDate = resolveMonthDaySettingDate(settings.septemberSendDate, batchYear, 9, 1, tz);
-  const deadline = resolveMonthDaySettingDate(settings.septemberDeadline, batchYear, 9, 30, tz);
   return {
-    batchId: `${batchYear}H2`,
-    label: `${batchYear}年9月便`,
-    sendDate,
-    deadline,
-    targetStart,
-    targetEnd,
+    batchId: upcoming.batchId,
+    label: upcoming.label,
+    sendDate: upcoming.sendDate,
+    deadline: upcoming.deadline,
+    targetStart: null,
+    targetEnd: upcoming.targetEnd,
   };
 }
 
-function resolveMonthDaySettingDate(
-  rawValue: any,
+function resolveConfiguredPeriods(year: number, settings: ReturnType<typeof loadSettings>, tz: string) {
+  validateConfiguredPeriodMonths(settings.periodAStartMonth, settings.periodBStartMonth);
+  return [
+    buildConfiguredPeriodDefinition(year, 'A', '期間A便', settings.periodAStartMonth, tz),
+    buildConfiguredPeriodDefinition(year, 'B', '期間B便', settings.periodBStartMonth, tz),
+  ];
+}
+
+function buildConfiguredPeriodDefinition(
   year: number,
-  fallbackMonth: number,
-  fallbackDay: number,
+  code: 'A' | 'B',
+  name: '期間A便' | '期間B便',
+  month: number,
   tz: string,
 ) {
-  if (rawValue instanceof Date) {
-    return toDateOnly(rawValue, tz);
-  }
-  const text = String(rawValue || '').trim();
-  if (text) {
-    const fullDateMatch = text.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/);
-    if (fullDateMatch) {
-      const parsed = new Date(Number(fullDateMatch[1]), Number(fullDateMatch[2]) - 1, Number(fullDateMatch[3]));
-      return toDateOnly(parsed, tz);
-    }
+  const baseDate = toDateOnly(new Date(year, month - 1, 1), tz);
+  const deadline = addMonthsClamped(baseDate, 1);
+  return {
+    code,
+    name,
+    batchId: `${year}${code}`,
+    label: `${year}年${name}`,
+    baseDate,
+    sendDate: baseDate,
+    deadline,
+    targetEnd: baseDate,
+  };
+}
 
-    const monthDayMatch = text.match(/^(\d{1,2})[/-](\d{1,2})$/);
-    if (monthDayMatch) {
-      const parsed = new Date(year, Number(monthDayMatch[1]) - 1, Number(monthDayMatch[2]));
-      return toDateOnly(parsed, tz);
-    }
-
-    const jpMonthDayMatch = text.match(/^(\d{1,2})月(\d{1,2})日?$/);
-    if (jpMonthDayMatch) {
-      const parsed = new Date(year, Number(jpMonthDayMatch[1]) - 1, Number(jpMonthDayMatch[2]));
-      return toDateOnly(parsed, tz);
-    }
+function validateConfiguredPeriodMonths(periodAStartMonth: number, periodBStartMonth: number) {
+  if (periodAStartMonth === periodBStartMonth) {
+    throw new Error('期間Aの開始月 と 期間Bの開始月 は異なる値にしてください。');
   }
-  return toDateOnly(new Date(year, fallbackMonth - 1, fallbackDay), tz);
+  if (periodAStartMonth > periodBStartMonth) {
+    throw new Error('期間Aの開始月 は 期間Bの開始月 より前の月にしてください。');
+  }
 }
 
 function findNotifyBatchRow(batchData: any[][], headerMap: { [key: string]: number }, batchId: string) {
@@ -3405,24 +3410,17 @@ function loadSourceVehicleContext() {
   };
 }
 
-function pickVehiclesByContractEndRange(
-  rows: any[][],
-  headerMap: { [key: string]: number },
-  start: Date,
-  end: Date,
-  tz: string,
-) {
+function pickVehiclesBeforeContractEndDate(rows: any[][], headerMap: { [key: string]: number }, baseDate: Date, tz: string) {
   const contractEndIndex = headerMap['契約満了日'];
   if (!contractEndIndex) return [];
-  const startDate = toDateOnly(start, tz);
-  const endDate = toDateOnly(end, tz);
+  const thresholdDate = toDateOnly(baseDate, tz);
 
   return rows.filter((row) => {
     if (row.every((cell) => cell === '' || cell === null)) return false;
     const contractEnd = parseDateValue(getCellRaw(row, contractEndIndex));
     if (!contractEnd) return false;
     const contractDate = toDateOnly(contractEnd, tz);
-    return isWithinRange(contractDate, startDate, endDate);
+    return contractDate.getTime() < thresholdDate.getTime();
   });
 }
 
@@ -3475,10 +3473,18 @@ function loadSettings() {
     hqTo: toStringValue(values['本部長副本部長_通知先To'], String(SETTINGS_DEFAULTS['本部長副本部長_通知先To'])),
     senmuTo: toStringValue(values['専務_通知先To'], String(SETTINGS_DEFAULTS['専務_通知先To'])),
     senmuCc: toStringValue(values['専務_通知先Cc'], String(SETTINGS_DEFAULTS['専務_通知先Cc'])),
-    marchSendDate: values['半期送付日_3月'] || SETTINGS_DEFAULTS['半期送付日_3月'],
-    septemberSendDate: values['半期送付日_9月'] || SETTINGS_DEFAULTS['半期送付日_9月'],
-    marchDeadline: values['回答期限_3月'] || SETTINGS_DEFAULTS['回答期限_3月'],
-    septemberDeadline: values['回答期限_9月'] || SETTINGS_DEFAULTS['回答期限_9月'],
+    periodAStartMonth: resolveConfiguredPeriodMonthValue(
+      values,
+      '期間Aの開始月',
+      ['半期基準日_3月', '半期送付日_3月'],
+      Number(SETTINGS_DEFAULTS['期間Aの開始月']),
+    ),
+    periodBStartMonth: resolveConfiguredPeriodMonthValue(
+      values,
+      '期間Bの開始月',
+      ['半期基準日_9月', '半期送付日_9月'],
+      Number(SETTINGS_DEFAULTS['期間Bの開始月']),
+    ),
     reminderBeforeDays: toNumber(values['リマインド_期限前日数'], Number(SETTINGS_DEFAULTS['リマインド_期限前日数'])),
     autoAdvanceEnabled: toBoolean(values['自動進行_有効'], Boolean(SETTINGS_DEFAULTS['自動進行_有効'])),
     autoAdvanceTimerEnabled: toBoolean(
@@ -3513,6 +3519,65 @@ function loadSettings() {
     murataTo: toStringValue(values['村田主任_通知先To'], String(SETTINGS_DEFAULTS['村田主任_通知先To'])),
     murataCc: toStringValue(values['村田主任_通知先Cc'], String(SETTINGS_DEFAULTS['村田主任_通知先Cc'])),
   };
+}
+
+function resolveConfiguredPeriodMonthValue(
+  values: { [key: string]: any },
+  primaryKey: string,
+  legacyKeys: string[],
+  fallback: number,
+) {
+  const primary = values[primaryKey];
+  if (primary !== null && primary !== undefined && primary !== '') {
+    return parseConfiguredMonthValue(primary, primaryKey);
+  }
+  for (let i = 0; i < legacyKeys.length; i++) {
+    const legacy = values[legacyKeys[i]];
+    if (legacy === null || legacy === undefined || legacy === '') continue;
+    return parseConfiguredMonthValue(legacy, legacyKeys[i]);
+  }
+  return fallback;
+}
+
+function parseConfiguredMonthValue(rawValue: any, label: string) {
+  if (rawValue instanceof Date) {
+    return rawValue.getMonth() + 1;
+  }
+  if (typeof rawValue === 'number') {
+    return validateConfiguredMonth(Math.floor(rawValue), label);
+  }
+
+  const text = String(rawValue || '').trim();
+  if (!text) {
+    throw new Error(`${label} が未設定です。`);
+  }
+  if (/^\d{1,2}$/.test(text)) {
+    return validateConfiguredMonth(Number(text), label);
+  }
+
+  const fullDateMatch = text.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/);
+  if (fullDateMatch) {
+    return validateConfiguredMonth(Number(fullDateMatch[2]), label);
+  }
+
+  const monthDayMatch = text.match(/^(\d{1,2})[/-](\d{1,2})$/);
+  if (monthDayMatch) {
+    return validateConfiguredMonth(Number(monthDayMatch[1]), label);
+  }
+
+  const jpMonthDayMatch = text.match(/^(\d{1,2})月(\d{1,2})日?$/);
+  if (jpMonthDayMatch) {
+    return validateConfiguredMonth(Number(jpMonthDayMatch[1]), label);
+  }
+
+  throw new Error(`${label} は 1〜12 の整数で入力してください。`);
+}
+
+function validateConfiguredMonth(month: number, label: string) {
+  if (!Number.isFinite(month) || month < 1 || month > 12) {
+    throw new Error(`${label} は 1〜12 の整数で入力してください。`);
+  }
+  return month;
 }
 
 function convertLegacyAutoAdvanceHours(value: any) {

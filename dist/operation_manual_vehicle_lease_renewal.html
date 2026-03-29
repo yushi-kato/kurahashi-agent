@@ -71,12 +71,12 @@
     H2 --> C
     I --> J[マスター自動反映<br>→ 車両一覧に書き戻し]
 </pre>
-<p>年2回（<strong>3月便</strong> / <strong>9月便</strong>）、この流れで処理します。</p>
+<p>年2回（<strong>期間A便</strong> / <strong>期間B便</strong>）、この流れで処理します。</p>
 <table>
-<thead><tr><th>便名</th><th>対象期間</th><th>締切</th></tr></thead>
+<thead><tr><th>便名</th><th>抽出条件</th><th>回答期限</th></tr></thead>
 <tbody>
-<tr><td><strong>3月便</strong></td><td>前年10月1日 〜 当年3月31日満了分</td><td>3月31日</td></tr>
-<tr><td><strong>9月便</strong></td><td>4月1日 〜 9月30日満了分</td><td>9月30日</td></tr>
+<tr><td><strong>期間A便</strong></td><td><code>期間Aの開始月</code> の1日より前に満了する車両</td><td>基準日の1か月後</td></tr>
+<tr><td><strong>期間B便</strong></td><td><code>期間Bの開始月</code> の1日より前に満了する車両</td><td>基準日の1か月後</td></tr>
 </tbody>
 </table>
 <hr>
@@ -124,7 +124,7 @@
 <p>新しくこのシステムを使い始めるとき、運用管理者が次の手順を実行してください。</p>
 <ol>
 <li>「設定」シートを開き、必要な設定項目が並んでいることを確認する</li>
-<li>「設定」シートで通知先や締切日を入力する（→ <a href="#設定タブの項目">設定項目の一覧</a>）</li>
+<li>「設定」シートで通知先と各期間の開始月を入力する（→ <a href="#設定タブの項目">設定項目の一覧</a>）</li>
 <li>保守担当者が <code>seedSettings()</code> と <code>installDailyTriggers()</code> を実行し、設定ひな形の不足補完とトリガー設定を行う</li>
 </ol>
 <p>これで自動進行の定期トリガーが設定され、リマインド送信・専務依頼送信・マスター反映などが自動で動くようになります。<br>
@@ -143,7 +143,7 @@
 <table>
 <thead><tr><th>タブ名</th><th>役割</th><th>主に見る人</th></tr></thead>
 <tbody>
-<tr><td><strong>設定</strong></td><td>通知先・締切日などの運用ルール</td><td>運用管理者</td></tr>
+<tr><td><strong>設定</strong></td><td>通知先・期間開始月などの運用ルール</td><td>運用管理者</td></tr>
 <tr><td><strong>車両一覧</strong></td><td>元台帳であり最終反映先でもある唯一の正本</td><td>台帳管理担当 / システム</td></tr>
 <tr><td><strong>通知バッチ</strong></td><td>半期便の進捗記録</td><td>運用管理者</td></tr>
 <tr><td><strong>本部長副本部長確認_YYYYMMDD</strong></td><td>回答・承認の入力画面</td><td>本部長・副本部長 / 専務 / 村田主任</td></tr>
@@ -161,8 +161,8 @@
 <tr><td><code>専務_通知先Cc</code></td><td>専務依頼のCC（任意）</td><td>メールアドレス</td></tr>
 <tr><td><code>村田主任_通知先To</code></td><td>村田主任通知の送付先</td><td>メールアドレス</td></tr>
 <tr><td><code>村田主任_通知先Cc</code></td><td>村田主任通知のCC（任意）</td><td>メールアドレス</td></tr>
-<tr><td><code>半期送付日_3月</code> / <code>半期送付日_9月</code></td><td>各便の送付日</td><td>3月1日 / 9月1日</td></tr>
-<tr><td><code>回答期限_3月</code> / <code>回答期限_9月</code></td><td>各便の締切日</td><td>3月31日 / 9月30日</td></tr>
+<tr><td><code>期間Aの開始月</code></td><td>期間A便の基準月。1日を基準日に使う</td><td><code>3</code></td></tr>
+<tr><td><code>期間Bの開始月</code></td><td>期間B便の基準月。1日を基準日に使う</td><td><code>9</code></td></tr>
 <tr><td><code>リマインド_期限前日数</code></td><td>締切何日前にリマインドを送るか</td><td>10</td></tr>
 <tr><td><code>通知_メール送信</code></td><td>メールを実際に送るか</td><td>TRUE / FALSE</td></tr>
 <tr><td><code>自動進行_有効</code></td><td>自動進行モードのON/OFF</td><td>TRUE / FALSE</td></tr>
@@ -173,6 +173,7 @@
 <tr><td><code>自動進行_マスター反映_有効</code></td><td>マスター反映を自動で行うか</td><td>TRUE / FALSE</td></tr>
 </tbody>
 </table>
+<p><code>期間Aの開始月</code> / <code>期間Bの開始月</code> は、車両抽出の基準月です。入力した月の1日を基準日として使い、<code>契約満了日</code> がその日より前の車両を抽出します。回答期限は、その基準日の1か月後を自動で使います。</p>
 <hr>
 <h2 id="困ったときの対応">困ったときの対応</h2>
 <table>
