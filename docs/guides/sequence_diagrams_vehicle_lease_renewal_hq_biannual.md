@@ -86,9 +86,7 @@ sequenceDiagram
 
     Senmu->>Conf: 専務判断/専務コメントを入力する
 
-    HQ->>GAS: 確認用シート編集イベントで自動進行を起動
-    Senmu->>GAS: 確認用シート編集イベントで自動進行を起動
-    Murata->>GAS: 確認用シート編集イベントで自動進行を起動
+    Timer->>GAS: 定期トリガーで次回の自動進行を起動
     GAS->>Conf: 専務判断/反映条件を再評価する
     alt 専務判断反映が有効かつ条件一致
         GAS->>Batch: 専務判断ステータスを更新する
@@ -139,7 +137,6 @@ sequenceDiagram
     participant FDecision as "applySenmuDecisionFromSheet"
     participant FApply as "applyMasterUpdates"
     participant FAuto as "runAutoAdvance"
-    participant FEdit as "onEditAutoAdvance"
     participant FSourceEdit as "onEditSourceSync"
     participant Set as "設定"
     participant List as "車両一覧"
@@ -213,13 +210,13 @@ sequenceDiagram
     FApply->>Batch: WRITE（最終ステータス）
     FApply->>Log: WRITE（反映結果）
 
-    Note over FAuto,FEdit: 自動進行モード（設定ON時）
+    Note over FAuto: 自動進行モード（設定ON時）
     FAuto->>FSheet: 確認用シート未作成なら生成
     FAuto->>FInit: 初回通知未送信なら送信
     FAuto->>FRem: 条件一致時のみリマインド
     FAuto->>FSenmu: 全件確認済みなら専務依頼送信
-    FEdit->>FDecision: 専務判断反映を自動実行
-    FEdit->>FApply: 反映条件を満たす行を自動反映
+    FAuto->>FDecision: 定期トリガーで専務判断反映を再評価
+    FAuto->>FApply: 定期トリガーで反映条件を満たす行を自動反映
 
     Note over FSourceEdit,FSync: 同期漏れ対策
     FSourceEdit->>FSync: 車両一覧のデータ行編集時に実行（最小間隔ガードあり）
