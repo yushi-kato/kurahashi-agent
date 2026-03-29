@@ -182,9 +182,9 @@ function onOpen() {
     .addItem('運用マニュアル（このシートで見る）', 'showOperationManual')
     .addItem('初期車両登録マニュアル（このシートで見る）', 'showInitialVehicleRegistrationManual')
     .addItem('テスト手順書（このシートで見る）', 'showTestGuide')
-    .addItem('半期一括実行', 'runDaily')
+    .addItem('新しい確認依頼を開始（対象抽出〜初回通知）', 'runDaily')
     .addSeparator()
-    .addSubMenu(ui.createMenu('手動ステップ').addItem('自動進行（最新バッチ）', 'runAutoAdvanceNow'))
+    .addSubMenu(ui.createMenu('途中再開・復旧').addItem('進行中の確認依頼を再開（最新）', 'runAutoAdvanceNow'))
     .addSubMenu(
       ui.createMenu('管理・設定')
         .addItem('スキーマ同期', 'syncSchema')
@@ -2187,10 +2187,11 @@ function runTestSuite() {
 
   const onOpenSource = String((globalThis as any).onOpen || onOpen).replace(/\s+/g, ' ');
   const manualMenuSlimmed =
-    onOpenSource.includes("addSubMenu(ui.createMenu('手動ステップ').addItem('自動進行（最新バッチ）', 'runAutoAdvanceNow'))") &&
+    onOpenSource.includes("addItem('新しい確認依頼を開始（対象抽出〜初回通知）', 'runDaily')") &&
+    onOpenSource.includes("addSubMenu(ui.createMenu('途中再開・復旧').addItem('進行中の確認依頼を再開（最新）', 'runAutoAdvanceNow'))") &&
     !onOpenSource.includes('村田主任通知送信（最新バッチ）') &&
     !onOpenSource.includes('マスター反映（最新バッチ）');
-  appendTestResult('期待値:手動メニュー整理', manualMenuSlimmed ? 'OK' : 'NG', '手動ステップは自動進行のみ');
+  appendTestResult('期待値:手動メニュー整理', manualMenuSlimmed ? 'OK' : 'NG', '開始と途中再開の2導線に整理');
 
   const legacyCheck = verifyAcceptanceCondition7LegacyNonReachable();
   appendTestResult(
