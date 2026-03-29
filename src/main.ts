@@ -1573,6 +1573,8 @@ function applyMasterUpdates(batchId?: string, options?: { suppressUi?: boolean }
     notifyMurataMasterApplyIssues(settings, batchContext, confirmationSheet, invalidEntries, options);
     notifyMurataMasterApplyCompleted(settings, batchContext, confirmationSheet, appliedEntries, options);
 
+    // マスター反映は定期トリガーや再開メニューから非同期に進むバッチ処理なので、
+    // 人の応答を止めるモーダルではなく通知ログと確認用シートの更新結果を正とする。
     appendNotificationLog(
       'マスター反映',
       '',
@@ -1580,18 +1582,6 @@ function applyMasterUpdates(batchId?: string, options?: { suppressUi?: boolean }
       resolvedBatchId,
       `反映:${applied} 待機:${waiting} 差戻し:${returned} スキップ:${skipped}`,
     );
-    if (!options?.suppressUi) {
-      uiShowModalSafe(
-        'マスター反映',
-        [
-          `batchId: ${resolvedBatchId}`,
-          `反映: ${applied}`,
-          `待機（専務未承認）: ${waiting}`,
-          `差戻し: ${returned}`,
-          `スキップ（入力不足・不整合）: ${skipped}`,
-        ].join('\n'),
-      );
-    }
 
     return resolvedBatchId;
   } finally {
