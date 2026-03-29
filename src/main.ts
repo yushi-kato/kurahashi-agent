@@ -73,6 +73,7 @@ const HQ_CONFIRMATION_HEADERS = [
   '新契約満了日',
   '解約完了',
   '村田主任確認済み',
+  '不正理由',
   '反映日時',
 ];
 const VIEW_SHEET_PROTECTION_DESC_PREFIX = 'managed_by_script:view_sheet:';
@@ -131,6 +132,10 @@ const SCHEMA_DEFS = [
       'リマインド送信日時',
       '専務依頼送信日時',
       '村田主任通知送信日時',
+      '村田主任不備通知日時',
+      '村田主任不備通知ハッシュ',
+      '村田主任反映完了通知日時',
+      '村田主任反映完了通知ハッシュ',
       'ステータス',
       '作成日時',
       '更新日時',
@@ -179,20 +184,7 @@ function onOpen() {
     .addItem('テスト手順書（このシートで見る）', 'showTestGuide')
     .addItem('半期一括実行', 'runDaily')
     .addSeparator()
-    .addSubMenu(
-      ui.createMenu('手動ステップ')
-        .addItem('車両一覧同期（要入力更新）', 'syncVehicles')
-        .addItem('半期バッチ起票', 'createBiannualBatch')
-        .addItem('確認用シート生成（最新バッチ）', 'buildConfirmationSheetForLatestBatch')
-        .addItem('初回通知送信（最新バッチ）', 'sendHqInitialEmail')
-        .addItem('リマインド送信（条件一致時）', 'sendHqReminderIfNeeded')
-        .addItem('専務依頼送信（全件確認後）', 'sendSenmuApprovalRequestIfReady')
-        .addItem('専務判断反映（最新バッチ）', 'applySenmuDecisionFromSheet')
-        .addItem('差戻し通知送信（最新バッチ）', 'sendHqReturnNotification')
-        .addItem('村田主任通知送信（最新バッチ）', 'sendMurataApprovalNotification')
-        .addItem('マスター反映（最新バッチ）', 'applyMasterUpdates')
-        .addItem('自動進行（最新バッチ）', 'runAutoAdvanceNow'),
-    )
+    .addSubMenu(ui.createMenu('手動ステップ').addItem('自動進行（最新バッチ）', 'runAutoAdvanceNow'))
     .addSubMenu(
       ui.createMenu('管理・設定')
         .addItem('スキーマ同期', 'syncSchema')
@@ -557,6 +549,7 @@ function buildConfirmationSheet(batchId: string) {
     '',
     false,
     false,
+    '',
     '',
   ]);
 
@@ -1184,6 +1177,210 @@ function sendMurataApprovalNotification(batchId?: string, options?: { suppressUi
   }
 }
 
+function buildMasterApplyValidationResult(row: any[], headerMap: { [key: string]: number }) {
+  const vehicleId = getCellValue(row, headerMap['vehicleId']);
+  const registration = getCellValue(row, headerMap['登録番号']) || vehicleId || '車両不明';
+  const policy = normalizeAnswerLabel(getCellValue(row, headerMap['本部回答']));
+  const decision = normalizeSenmuDecision(getCellValue(row, headerMap['専務判断']));
+  const reasons: string[] = [];
+
+  if (decision !== APPROVAL_INPUT.APPROVE) {
+    reasons.push('専務判断が「承認」ではありません');
+  }
+  if (!policy) {
+    reasons.push('本部回答が未入力です');
+  } else if (policy === ANSWER_LABELS.RENEW) {
+    if (!parseDateValue(getCellRaw(row, headerMap['新契約開始日']))) {
+      reasons.push('新契約開始日が未入力です');
+    }
+    if (!parseDateValue(getCellRaw(row, headerMap['新契約満了日']))) {
+      reasons.push('新契約満了日が未入力です');
+    }
+  } else if (!isCheckedCell(getCellRaw(row, headerMap['解約完了']))) {
+    reasons.push('解約完了がチェックされていません');
+  }
+
+  return {
+    vehicleId,
+    registration,
+    policy,
+    decision,
+    reasons,
+  };
+}
+
+function buildMasterApplyNotificationLine(
+  entry: { registration: string; vehicleId: string; policy: string; reasons?: string[] },
+  includeReasons: boolean,
+) {
+  const parts = [entry.registration || entry.vehicleId || '車両不明'];
+  if (entry.policy) parts.push(entry.policy);
+  if (includeReasons && entry.reasons && entry.reasons.length > 0) {
+    parts.push(entry.reasons.join(' / '));
+  }
+  return parts.join(' | ');
+}
+
+function createContentHash(lines: string[]) {
+  const normalized = lines.join('\n');
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, normalized);
+  return bytes.map((b) => ((b + 256) % 256).toString(16).padStart(2, '0')).join('');
+}
+
+function notifyMurataMasterApplyIssues(
+  settings: ReturnType<typeof loadSettings>,
+  batchContext: ReturnType<typeof getNotifyBatchContext>,
+  confirmationSheet: GoogleAppsScript.Spreadsheet.Sheet,
+  invalidEntries: Array<{ vehicleId: string; registration: string; policy: string; reasons: string[] }>,
+  options?: { suppressUi?: boolean },
+) {
+  if (!batchContext) return false;
+  const { ss, notifyBatchSheet, batchData, headerMap, row, batchId } = batchContext;
+  const murataTo = String(settings.murataTo || '').trim();
+  const hashHeader = headerMap['村田主任不備通知ハッシュ'];
+  const sentAtHeader = headerMap['村田主任不備通知日時'];
+  if (!hashHeader || !sentAtHeader) return false;
+
+  if (invalidEntries.length === 0) {
+    const hadState = !!getCellRaw(row, hashHeader) || !!getCellRaw(row, sentAtHeader);
+    row[hashHeader - 1] = '';
+    row[sentAtHeader - 1] = '';
+    if (hadState) {
+      row[headerMap['更新日時'] - 1] = new Date();
+      notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
+    }
+    return false;
+  }
+
+  const sorted = invalidEntries
+    .slice()
+    .sort((a, b) => buildMasterApplyNotificationLine(a, true).localeCompare(buildMasterApplyNotificationLine(b, true), 'ja'));
+  const detailLines = sorted.map((entry) => `- ${buildMasterApplyNotificationLine(entry, true)}`);
+  const nextHash = createContentHash(detailLines);
+  const prevHash = String(getCellRaw(row, hashHeader) || '').trim();
+  if (nextHash === prevHash) {
+    appendNotificationLog('村田主任不備通知', '', murataTo, batchId, '同一内容のため再通知なし');
+    return false;
+  }
+
+  if (!settings.mailSendEnabled) {
+    appendNotificationLog('村田主任不備通知', '', '', batchId, '通知_メール送信=FALSE のため送信をスキップ');
+    return false;
+  }
+  if (!murataTo) {
+    appendNotificationLog('村田主任不備通知', '', '', batchId, '村田主任_通知先Toが未設定');
+    if (!options?.suppressUi) {
+      uiAlertSafe('設定「村田主任_通知先To」が未設定のため不備通知を送信できません。');
+    }
+    return false;
+  }
+
+  const batchLabel = getCellValue(row, headerMap['便区分']) || batchId;
+  const sheetUrl = buildSheetUrlWithGid(ss, confirmationSheet);
+  const subject = `【確認要】${batchLabel} マスター反映で修正が必要な項目があります`;
+  const body = [
+    '村田主任',
+    '',
+    `${batchLabel} のマスター反映処理で、確認が必要な項目が見つかりました。`,
+    '確認用シートの「不正理由」列にも同じ内容を残しています。',
+    '',
+    '対象一覧:',
+    ...detailLines,
+    '',
+    '確認用シート:',
+    sheetUrl,
+    '',
+    `管理番号: ${batchId}`,
+    '',
+    '内容を修正いただくと、次回の自動進行で再判定・反映されます。',
+  ].join('\n');
+
+  MailApp.sendEmail({
+    to: murataTo,
+    cc: String(settings.murataCc || ''),
+    subject,
+    name: settings.fromName,
+    body,
+  });
+  const now = new Date();
+  row[hashHeader - 1] = nextHash;
+  row[sentAtHeader - 1] = now;
+  row[headerMap['更新日時'] - 1] = now;
+  notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
+  appendNotificationLog('村田主任不備通知', '', murataTo, batchId, `成功 ${invalidEntries.length}件`);
+  return true;
+}
+
+function notifyMurataMasterApplyCompleted(
+  settings: ReturnType<typeof loadSettings>,
+  batchContext: ReturnType<typeof getNotifyBatchContext>,
+  confirmationSheet: GoogleAppsScript.Spreadsheet.Sheet,
+  appliedEntries: Array<{ vehicleId: string; registration: string; policy: string }>,
+  options?: { suppressUi?: boolean },
+) {
+  if (!batchContext || appliedEntries.length === 0) return false;
+  const { ss, notifyBatchSheet, batchData, headerMap, row, batchId } = batchContext;
+  const murataTo = String(settings.murataTo || '').trim();
+  const hashHeader = headerMap['村田主任反映完了通知ハッシュ'];
+  const sentAtHeader = headerMap['村田主任反映完了通知日時'];
+  if (!hashHeader || !sentAtHeader) return false;
+
+  const sorted = appliedEntries
+    .slice()
+    .sort((a, b) => buildMasterApplyNotificationLine(a, false).localeCompare(buildMasterApplyNotificationLine(b, false), 'ja'));
+  const detailLines = sorted.map((entry) => `- ${buildMasterApplyNotificationLine(entry, false)}`);
+  const nextHash = createContentHash(detailLines);
+  const prevHash = String(getCellRaw(row, hashHeader) || '').trim();
+  if (nextHash === prevHash) {
+    appendNotificationLog('村田主任反映完了通知', '', murataTo, batchId, '同一内容のため再通知なし');
+    return false;
+  }
+
+  if (!settings.mailSendEnabled) {
+    appendNotificationLog('村田主任反映完了通知', '', '', batchId, '通知_メール送信=FALSE のため送信をスキップ');
+    return false;
+  }
+  if (!murataTo) {
+    appendNotificationLog('村田主任反映完了通知', '', '', batchId, '村田主任_通知先Toが未設定');
+    if (!options?.suppressUi) {
+      uiAlertSafe('設定「村田主任_通知先To」が未設定のため反映完了通知を送信できません。');
+    }
+    return false;
+  }
+
+  const batchLabel = getCellValue(row, headerMap['便区分']) || batchId;
+  const sheetUrl = buildSheetUrlWithGid(ss, confirmationSheet);
+  const subject = `【反映完了】${batchLabel} マスター反映が完了した項目があります`;
+  const body = [
+    '村田主任',
+    '',
+    `${batchLabel} のマスター反映で、今回新たに完了した項目をお知らせします。`,
+    '',
+    '反映完了一覧:',
+    ...detailLines,
+    '',
+    '確認用シート:',
+    sheetUrl,
+    '',
+    `管理番号: ${batchId}`,
+  ].join('\n');
+
+  MailApp.sendEmail({
+    to: murataTo,
+    cc: String(settings.murataCc || ''),
+    subject,
+    name: settings.fromName,
+    body,
+  });
+  const now = new Date();
+  row[hashHeader - 1] = nextHash;
+  row[sentAtHeader - 1] = now;
+  row[headerMap['更新日時'] - 1] = now;
+  notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
+  appendNotificationLog('村田主任反映完了通知', '', murataTo, batchId, `成功 ${appliedEntries.length}件`);
+  return true;
+}
+
 function applyMasterUpdates(batchId?: string, options?: { suppressUi?: boolean }) {
   const lock = LockService.getDocumentLock();
   lock.waitLock(30000);
@@ -1193,6 +1390,7 @@ function applyMasterUpdates(batchId?: string, options?: { suppressUi?: boolean }
     const { ss, notifyBatchSheet, batchData, headerMap, row } = batchContext;
     const resolvedBatchId = batchContext.batchId;
     const tz = ss.getSpreadsheetTimeZone();
+    const settings = loadSettings();
 
     // ステータスガード: SENMU_APPROVED以外ではマスター反映しない
     const currentStatus = getCellValue(row, headerMap['ステータス']);
@@ -1203,14 +1401,21 @@ function applyMasterUpdates(batchId?: string, options?: { suppressUi?: boolean }
 
     const confirmationSheetName = getCellValue(row, headerMap['確認用シート名']);
     if (!confirmationSheetName) {
-      uiAlertSafe(`確認用シート名が未設定です。\nbatchId: ${resolvedBatchId}`);
+      appendNotificationLog('マスター反映', '', '', resolvedBatchId, '確認用シート名が未設定のためスキップ');
+      if (!options?.suppressUi) {
+        uiAlertSafe(`確認用シート名が未設定です。\nbatchId: ${resolvedBatchId}`);
+      }
       return resolvedBatchId;
     }
     const confirmationSheet = ss.getSheetByName(confirmationSheetName);
     if (!confirmationSheet) {
-      uiAlertSafe(`確認用シートが見つかりません。\n${confirmationSheetName}`);
+      appendNotificationLog('マスター反映', '', '', resolvedBatchId, `確認用シートが見つかりません: ${confirmationSheetName}`);
+      if (!options?.suppressUi) {
+        uiAlertSafe(`確認用シートが見つかりません。\n${confirmationSheetName}`);
+      }
       return resolvedBatchId;
     }
+    ensureConfirmationSheetSchema(confirmationSheet);
 
     const vehicleSheet = ss.getSheetByName(PRIMARY_SOURCE_SHEET);
     if (!vehicleSheet) throw new Error('車両一覧が存在しません');
@@ -1238,22 +1443,33 @@ function applyMasterUpdates(batchId?: string, options?: { suppressUi?: boolean }
     let returned = 0;
     let modifiedVehicle = false;
     let modifiedConfirmation = false;
-
-    const allErrors: string[] = [];
+    const invalidEntries: Array<{ vehicleId: string; registration: string; policy: string; reasons: string[] }> = [];
+    const appliedEntries: Array<{ vehicleId: string; registration: string; policy: string }> = [];
+    const invalidReasonCol = ch['不正理由'];
 
     for (let i = 1; i < confirmationData.length; i++) {
       const cRow = confirmationData[i];
       const vehicleId = getCellValue(cRow, ch['vehicleId']);
       if (!vehicleId) continue;
 
+      const setInvalidReason = (value: string) => {
+        if (!invalidReasonCol) return;
+        const current = String(cRow[invalidReasonCol - 1] || '');
+        if (current === value) return;
+        cRow[invalidReasonCol - 1] = value;
+        modifiedConfirmation = true;
+      };
+
       const decision = normalizeSenmuDecision(getCellValue(cRow, ch['専務判断']));
       if (decision === APPROVAL_INPUT.RETURN) {
+        setInvalidReason('');
         returned += 1;
         continue;
       }
 
       // 村田主任確認済みがチェックされていなければスキップ
       if (!isCheckedCell(getCellRaw(cRow, ch['村田主任確認済み']))) {
+        setInvalidReason('');
         if (decision !== APPROVAL_INPUT.APPROVE) {
           waiting += 1;
         } else {
@@ -1263,47 +1479,30 @@ function applyMasterUpdates(batchId?: string, options?: { suppressUi?: boolean }
       }
 
       // 二重反映防止
-      if (getCellValue(cRow, ch['反映日時'])) continue;
-
-      // バリデーション
-      const errors: string[] = [];
-      const vehicleLabel = getCellValue(cRow, ch['登録番号']) || vehicleId;
-
-      if (decision !== APPROVAL_INPUT.APPROVE) {
-        errors.push(`${vehicleLabel}: 専務判断が「承認」ではありません`);
-      }
-
-      const policy = normalizeAnswerLabel(getCellValue(cRow, ch['本部回答']));
-      if (!policy) {
-        errors.push(`${vehicleLabel}: 本部回答が未入力です`);
-      }
-
-      if (policy === ANSWER_LABELS.RENEW) {
-        if (!parseDateValue(getCellRaw(cRow, ch['新契約開始日']))) {
-          errors.push(`${vehicleLabel}: 新契約開始日が未入力です`);
-        }
-        if (!parseDateValue(getCellRaw(cRow, ch['新契約満了日']))) {
-          errors.push(`${vehicleLabel}: 新契約満了日が未入力です`);
-        }
-      }
-
-      if (policy && policy !== ANSWER_LABELS.RENEW) {
-        if (!isCheckedCell(getCellRaw(cRow, ch['解約完了']))) {
-          errors.push(`${vehicleLabel}: 解約完了がチェックされていません`);
-        }
-      }
-
-      if (errors.length > 0) {
-        allErrors.push(...errors);
-        skipped += 1;
+      if (getCellValue(cRow, ch['反映日時'])) {
+        setInvalidReason('');
         continue;
       }
 
+      const validation = buildMasterApplyValidationResult(cRow, ch);
+      const errors = validation.reasons.slice();
+      const policy = validation.policy;
+      skipped += 1;
       const vehicleRowIndex = vehicleRowIndexById[vehicleId];
       if (vehicleRowIndex === undefined) {
-        skipped += 1;
+        errors.push('車両一覧に対応する vehicleId が見つかりません');
+      }
+      if (errors.length > 0) {
+        setInvalidReason(errors.join('\n'));
+        invalidEntries.push({
+          vehicleId,
+          registration: validation.registration,
+          policy,
+          reasons: errors,
+        });
         continue;
       }
+      skipped -= 1;
 
       const vehicleRow = vehicleData[vehicleRowIndex];
       const setVehicle = (headerName: string, value: any) => {
@@ -1332,17 +1531,16 @@ function applyMasterUpdates(batchId?: string, options?: { suppressUi?: boolean }
         rowIndexesToGray.push(vehicleRowIndex + 1);
       }
 
+      setInvalidReason('');
       if (ch['反映日時']) cRow[ch['反映日時'] - 1] = now;
       applied += 1;
       modifiedVehicle = true;
       modifiedConfirmation = true;
-    }
-
-    if (allErrors.length > 0) {
-      appendNotificationLog('マスター反映', '', '', resolvedBatchId, `要確認項目あり: ${allErrors.join(' | ')}`);
-      if (!options?.suppressUi) {
-        uiShowModalSafe('確認が必要な項目があります', allErrors.join('\n'));
-      }
+      appliedEntries.push({
+        vehicleId,
+        registration: validation.registration,
+        policy,
+      });
     }
 
     if (modifiedVehicle) {
@@ -1363,6 +1561,18 @@ function applyMasterUpdates(batchId?: string, options?: { suppressUi?: boolean }
     }
     row[headerMap['更新日時'] - 1] = now;
     notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
+
+    if (invalidEntries.length > 0) {
+      appendNotificationLog(
+        'マスター反映',
+        '',
+        '',
+        resolvedBatchId,
+        `要確認項目あり: ${invalidEntries.map((entry) => buildMasterApplyNotificationLine(entry, true)).join(' | ')}`,
+      );
+    }
+    notifyMurataMasterApplyIssues(settings, batchContext, confirmationSheet, invalidEntries, options);
+    notifyMurataMasterApplyCompleted(settings, batchContext, confirmationSheet, appliedEntries, options);
 
     appendNotificationLog(
       'マスター反映',
@@ -1961,9 +2171,26 @@ function runTestSuite() {
       counts.total >= 0 ? 'OK' : 'NG',
       `total=${counts.total} unanswered=${counts.unanswered} unchecked=${counts.unchecked}`,
     );
+    appendTestResult('期待値:確認用シート不正理由列', ch['不正理由'] ? 'OK' : 'NG', JSON.stringify({ hasInvalidReason: !!ch['不正理由'] }));
   } else {
     appendTestResult('期待値:確認用シート生成件数', 'NG', '確認用シート未生成');
+    appendTestResult('期待値:確認用シート不正理由列', 'NG', '確認用シート未生成');
   }
+
+  const notifyBatchHeaders = getSchemaHeaders(SHEET_NAMES.NOTIFY_BATCH);
+  const hasMurataIssueHeaders =
+    notifyBatchHeaders.indexOf('村田主任不備通知日時') >= 0 &&
+    notifyBatchHeaders.indexOf('村田主任不備通知ハッシュ') >= 0 &&
+    notifyBatchHeaders.indexOf('村田主任反映完了通知日時') >= 0 &&
+    notifyBatchHeaders.indexOf('村田主任反映完了通知ハッシュ') >= 0;
+  appendTestResult('期待値:通知バッチ通知列', hasMurataIssueHeaders ? 'OK' : 'NG', JSON.stringify({ headers: notifyBatchHeaders }));
+
+  const onOpenSource = String((globalThis as any).onOpen || onOpen).replace(/\s+/g, ' ');
+  const manualMenuSlimmed =
+    onOpenSource.includes("addSubMenu(ui.createMenu('手動ステップ').addItem('自動進行（最新バッチ）', 'runAutoAdvanceNow'))") &&
+    !onOpenSource.includes('村田主任通知送信（最新バッチ）') &&
+    !onOpenSource.includes('マスター反映（最新バッチ）');
+  appendTestResult('期待値:手動メニュー整理', manualMenuSlimmed ? 'OK' : 'NG', '手動ステップは自動進行のみ');
 
   const legacyCheck = verifyAcceptanceCondition7LegacyNonReachable();
   appendTestResult(
@@ -2596,10 +2823,10 @@ function evaluateBatchPhase(batchId?: string) {
     phase = BATCH_PHASE.SENMU_RETURN_READY;
   } else if (!murataSentAt) {
     phase = BATCH_PHASE.MURATA_NOTIFY_READY;
-  } else if (murataGate.ready || status === BIANNUAL_BATCH_STATUS.COMPLETED) {
-    phase = status === BIANNUAL_BATCH_STATUS.COMPLETED ? BATCH_PHASE.COMPLETED : BATCH_PHASE.MASTER_APPLY_READY;
+  } else if (status === BIANNUAL_BATCH_STATUS.COMPLETED) {
+    phase = BATCH_PHASE.COMPLETED;
   } else {
-    phase = BATCH_PHASE.MURATA_NOTIFY_READY;
+    phase = BATCH_PHASE.MASTER_APPLY_READY;
   }
 
   return {
@@ -3099,27 +3326,31 @@ function clearReturnedSenmuStateOnReAnswer(
 function ensureConfirmationSheetSchema(sheet: GoogleAppsScript.Spreadsheet.Sheet) {
   const lastRow = sheet.getLastRow();
   if (lastRow <= 1) return;
-  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  const headerMap = getHeaderMap(headers);
+  const ensureColumn = (targetHeader: string, insertBeforeHeader?: string, checkbox?: boolean) => {
+    const currentHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const currentMap = getHeaderMap(currentHeaders);
+    if (currentMap[targetHeader]) return;
 
-  // 専務確認済み列がなければ、専務コメントの直後（新契約開始日の手前）に挿入
-  if (!headerMap['専務確認済み']) {
-    const insertBefore = headerMap['新契約開始日'];
+    const insertBefore = insertBeforeHeader ? currentMap[insertBeforeHeader] : 0;
     if (insertBefore && insertBefore <= sheet.getLastColumn()) {
       sheet.insertColumnBefore(insertBefore);
-      sheet.getRange(1, insertBefore).setValue('専務確認済み');
-      if (lastRow > 1) {
+      sheet.getRange(1, insertBefore).setValue(targetHeader);
+      if (checkbox && lastRow > 1) {
         sheet.getRange(2, insertBefore, lastRow - 1, 1).insertCheckboxes();
       }
-    } else {
-      // 新契約開始日が見つからない場合は末尾に追加
-      const newCol = sheet.getLastColumn() + 1;
-      sheet.getRange(1, newCol).setValue('専務確認済み');
-      if (lastRow > 1) {
-        sheet.getRange(2, newCol, lastRow - 1, 1).insertCheckboxes();
-      }
+      return;
     }
-  }
+
+    const newCol = sheet.getLastColumn() + 1;
+    sheet.getRange(1, newCol).setValue(targetHeader);
+    if (checkbox && lastRow > 1) {
+      sheet.getRange(2, newCol, lastRow - 1, 1).insertCheckboxes();
+    }
+  };
+
+  // 専務確認済み列がなければ、専務コメントの直後（新契約開始日の手前）に挿入
+  ensureColumn('専務確認済み', '新契約開始日', true);
+  ensureColumn('不正理由', '反映日時', false);
 
   // 既存だがチェックボックスでない場合の保険
   const updatedHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];

@@ -179,7 +179,7 @@
 <tbody>
 <tr><td><strong>メールが来ない</strong></td><td>「通知ログ」を確認。<code>通知_メール送信</code> が FALSE でないか、送信先が空でないか</td><td>設定を修正して再実行</td></tr>
 <tr><td><strong>専務依頼が来ない</strong></td><td>確認用シートで <code>本部回答</code> の空欄や <code>回答確認済み</code> の未チェックがないか</td><td>未入力・未チェックを埋めて待つ</td></tr>
-<tr><td><strong>マスター反映されない</strong></td><td><code>専務判断</code> が「承認」か、更新行に新契約日があるか、解約行に解約完了チェックがあるか</td><td>必須項目を埋めて手動で「マスター反映」を実行</td></tr>
+<tr><td><strong>マスター反映されない</strong></td><td>確認用シートの <code>不正理由</code> 列に何が残っているか、<code>専務判断</code> が「承認」か、更新行に新契約日があるか、解約行に解約完了チェックがあるか</td><td>必須項目を埋めて待つ。急ぎで再判定したい場合は手動で「自動進行（最新バッチ）」を実行</td></tr>
 </tbody>
 </table>
 <hr>
@@ -195,6 +195,8 @@
 <tr><td><strong>マスター反映</strong></td><td>専務判断が「承認」 かつ 必須入力完了（新契約日 または 解約完了チェック）</td></tr>
 <tr><td><strong>差戻し通知送信</strong></td><td>専務判断反映後、差戻し行あり かつ 全行に専務判断入力済み かつ 全行で「専務確認済み」チェック済み</td></tr>
 <tr><td><strong>村田主任通知送信</strong></td><td>専務判断反映後、全件承認 かつ 当バッチで村田主任通知未送信</td></tr>
+<tr><td><strong>村田主任不備通知送信</strong></td><td>村田主任確認済みの行に反映不可理由があり、前回通知から内容が変わった</td></tr>
+<tr><td><strong>村田主任反映完了通知送信</strong></td><td>今回の自動進行で新たにマスター反映できた行がある</td></tr>
 </tbody>
 </table>
 <p>トリガーが動いていない場合は、メニュー → 管理・設定 →「<strong>半期トリガー再作成</strong>」を実行してください。</p>
@@ -213,16 +215,6 @@
 <table>
 <thead><tr><th>メニュー項目</th><th>何をするか</th></tr></thead>
 <tbody>
-<tr><td><strong>車両一覧同期（要入力更新）</strong></td><td>車両一覧から対象を読み込み、不備を「要入力」に記録</td></tr>
-<tr><td><strong>半期バッチ起票</strong></td><td>新しい半期便を作成し対象車両を抽出</td></tr>
-<tr><td><strong>確認用シート生成（最新バッチ）</strong></td><td>確認用シートを作成</td></tr>
-<tr><td><strong>初回通知送信（最新バッチ）</strong></td><td>確認依頼メールを送付</td></tr>
-<tr><td><strong>リマインド送信（条件一致時）</strong></td><td>リマインドメールを送付</td></tr>
-<tr><td><strong>専務依頼送信（全件確認後）</strong></td><td>専務へ承認依頼メールを送付</td></tr>
-<tr><td><strong>専務判断反映（最新バッチ）</strong></td><td>専務の承認/差戻し結果をバッチに反映</td></tr>
-<tr><td><strong>差戻し通知送信（最新バッチ）</strong></td><td>差戻し行の一覧を本部長副本部長にメール送付し、再回答を促す</td></tr>
-<tr><td><strong>村田主任通知送信（最新バッチ）</strong></td><td>全件承認後に村田主任へ通知メールを送付</td></tr>
-<tr><td><strong>マスター反映（最新バッチ）</strong></td><td>承認済み車両を車両一覧に書き戻し</td></tr>
 <tr><td><strong>自動進行（最新バッチ）</strong></td><td>進められるステップをすべて実行</td></tr>
 </tbody>
 </table>
