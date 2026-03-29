@@ -46,6 +46,20 @@ const BATCH_PHASE = {
     MASTER_APPLY_READY: 'MASTER_APPLY_READY',
     COMPLETED: 'COMPLETED',
 };
+const START_LAUNCH_STATUS = {
+    BLOCKED: 'BLOCKED',
+    CONFIRM_REQUIRED: 'CONFIRM_REQUIRED',
+    READY: 'READY',
+};
+const START_REQUIRED_SETTING_LABELS = [
+    { key: 'hqTo', label: '本部長副本部長_通知先To' },
+    { key: 'senmuTo', label: '専務_通知先To' },
+    { key: 'murataTo', label: '村田主任_通知先To' },
+];
+const START_LAUNCH_DIAG_MODE = {
+    MANUAL: 'MANUAL',
+    SCHEDULED: 'SCHEDULED',
+};
 const HQ_CONFIRMATION_HEADERS = [
     'batchId',
     'vehicleId',
@@ -81,19 +95,7 @@ const SCHEMA_DEFS = [
     {
         name: PRIMARY_SOURCE_SHEET,
         headerRow: 1,
-        headers: [
-            'vehicleId',
-            '登録番号_結合',
-            '更新方針',
-            '依頼ID',
-            '回答日',
-            '備考',
-            '一次回答',
-            '最終決定',
-            '完了フラグ',
-            '完了日',
-            '完了メモ',
-        ],
+        headers: ['vehicleId', '登録番号_結合', '最終決定', '完了日'],
     },
     {
         name: SHEET_NAMES.NEEDS_INPUT,
@@ -155,6 +157,7 @@ const SETTINGS_DEFAULTS = {
     自動進行_マスター反映_有効: true,
     自動進行_最小間隔秒: 30,
     最終承認者アカウント: '',
+    運用管理者_通知先To: '',
     村田主任_通知先To: '',
     村田主任_通知先Cc: '',
 };
@@ -166,6 +169,7 @@ const PROP_KEYS = {
     AUTO_ADVANCE_LAST_RUN_AT: 'AUTO_ADVANCE_LAST_RUN_AT',
     SOURCE_SYNC_LAST_RUN_AT: 'SOURCE_SYNC_LAST_RUN_AT',
     ONEDIT_ADVANCE_LAST_RUN_AT: 'ONEDIT_ADVANCE_LAST_RUN_AT',
+    AUTO_START_BLOCK_NOTICE_PREFIX: 'AUTO_START_BLOCK_NOTICE_',
 };
 function onOpen() {
     const ui = SpreadsheetApp.getUi();
@@ -276,8 +280,6 @@ function syncVehicles() {
         const managedIndexes = {
             vehicleId: sourceHeader['vehicleId'],
             regCombined: sourceHeader['登録番号_結合'],
-            policy: sourceHeader['更新方針'],
-            primaryAnswer: sourceHeader['一次回答'],
         };
         const needsInputRows = [];
         const now = new Date();
@@ -285,7 +287,6 @@ function syncVehicles() {
         const rowCount = Math.max(0, sourceData.length - 1);
         const vehicleIdValues = [];
         const regCombinedValues = [];
-        const primaryAnswerValues = [];
         const hasContractEndHeader = !!sourceIndexes.contractEnd;
         const hasDeptHeader = !!sourceIndexes.dept;
         if (!hasContractEndHeader || !hasDeptHeader) {
@@ -296,12 +297,9 @@ function syncVehicles() {
             const rowNumber = i + 1;
             const existingVehicleId = getCellValue(row, managedIndexes.vehicleId);
             const existingRegCombined = getCellValue(row, managedIndexes.regCombined);
-            const existingPrimaryAnswer = getCellValue(row, managedIndexes.primaryAnswer);
-            const policy = getCellValue(row, managedIndexes.policy);
             if (row.every((cell) => cell === '' || cell === null)) {
                 vehicleIdValues.push([existingVehicleId]);
                 regCombinedValues.push([existingRegCombined]);
-                primaryAnswerValues.push([existingPrimaryAnswer]);
                 continue;
             }
             const regCombined = getSourceRegistrationCombined(row, sourceIndexes);
@@ -338,15 +336,12 @@ function syncVehicles() {
             }
             vehicleIdValues.push([vehicleId]);
             regCombinedValues.push([regCombined]);
-            primaryAnswerValues.push([existingPrimaryAnswer || policy]);
         }
         if (rowCount > 0) {
             if (managedIndexes.vehicleId)
                 sourceSheet.getRange(2, managedIndexes.vehicleId, rowCount, 1).setValues(vehicleIdValues);
             if (managedIndexes.regCombined)
                 sourceSheet.getRange(2, managedIndexes.regCombined, rowCount, 1).setValues(regCombinedValues);
-            if (managedIndexes.primaryAnswer)
-                sourceSheet.getRange(2, managedIndexes.primaryAnswer, rowCount, 1).setValues(primaryAnswerValues);
         }
         writeSheetData(SHEET_NAMES.NEEDS_INPUT, needsInputRows);
         protectViewSheet(SHEET_NAMES.NEEDS_INPUT);
@@ -355,7 +350,7 @@ function syncVehicles() {
         lock.releaseLock();
     }
 }
-function createBiannualBatch() {
+function createBiannualBatch(options) {
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
     try {
@@ -372,7 +367,9 @@ function createBiannualBatch() {
         const batchHeader = batchData.length > 0 ? getHeaderMap(batchData[0]) : {};
         const existing = findNotifyBatchRow(batchData, batchHeader, batchDef.batchId);
         if (existing) {
-            uiAlertSafe(`通知バッチ ${batchDef.batchId} は既に存在します。`);
+            if (!(options === null || options === void 0 ? void 0 : options.suppressUi)) {
+                uiAlertSafe(`通知バッチ ${batchDef.batchId} は既に存在します。`);
+            }
             return batchDef.batchId;
         }
         const vehicleContext = loadSourceVehicleContext();
@@ -400,11 +397,13 @@ function createBiannualBatch() {
         setCell('更新日時', now);
         notifyBatchSheet.getRange(notifyBatchSheet.getLastRow() + 1, 1, 1, newRow.length).setValues([newRow]);
         const confirmationSheetName = buildConfirmationSheet(batchDef.batchId);
-        uiAlertSafe(`半期バッチを起票しました。\n` +
-            `batchId: ${batchDef.batchId}\n` +
-            `対象期間: ${formatDateLabel(batchDef.targetStart, tz)}〜${formatDateLabel(batchDef.targetEnd, tz)}\n` +
-            `対象件数: ${targetVehicles.length}件\n` +
-            `確認用シート: ${confirmationSheetName}`);
+        if (!(options === null || options === void 0 ? void 0 : options.suppressUi)) {
+            uiAlertSafe(`半期バッチを起票しました。\n` +
+                `batchId: ${batchDef.batchId}\n` +
+                `対象期間: ${formatDateLabel(batchDef.targetStart, tz)}〜${formatDateLabel(batchDef.targetEnd, tz)}\n` +
+                `対象件数: ${targetVehicles.length}件\n` +
+                `確認用シート: ${confirmationSheetName}`);
+        }
         return batchDef.batchId;
     }
     finally {
@@ -535,14 +534,16 @@ function buildConfirmationSheet(batchId) {
     notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
     return sheetName;
 }
-function sendHqInitialEmail(batchId) {
+function sendHqInitialEmail(batchId, options) {
     const lock = LockService.getDocumentLock();
     lock.waitLock(30000);
     try {
         const settings = loadSettings();
         const batchContext = getNotifyBatchContext(batchId);
         if (!batchContext) {
-            uiAlertSafe('通知バッチが見つかりません。先に半期バッチ起票を実行してください。');
+            if (!(options === null || options === void 0 ? void 0 : options.suppressUi)) {
+                uiAlertSafe('通知バッチが見つかりません。先に半期バッチ起票を実行してください。');
+            }
             return '';
         }
         const { ss, notifyBatchSheet, batchData, headerMap, row } = batchContext;
@@ -555,12 +556,16 @@ function sendHqInitialEmail(batchId) {
         }
         if (!hqTo) {
             appendNotificationLog('半期初回通知', '', '', resolvedBatchId, '本部長副本部長_通知先Toが未設定');
-            uiAlertSafe('設定「本部長副本部長_通知先To」が未設定のため送信できません。');
+            if (!(options === null || options === void 0 ? void 0 : options.suppressUi)) {
+                uiAlertSafe('設定「本部長副本部長_通知先To」が未設定のため送信できません。');
+            }
             return resolvedBatchId;
         }
         const sentAt = parseDateValue(getCellRaw(row, headerMap['初回通知送信日時']));
         if (sentAt) {
-            uiAlertSafe(`初回通知は既に送信済みです。\nbatchId: ${resolvedBatchId}`);
+            if (!(options === null || options === void 0 ? void 0 : options.suppressUi)) {
+                uiAlertSafe(`初回通知は既に送信済みです。\nbatchId: ${resolvedBatchId}`);
+            }
             return resolvedBatchId;
         }
         let confirmationSheetName = getCellValue(row, headerMap['確認用シート名']);
@@ -614,7 +619,9 @@ function sendHqInitialEmail(batchId) {
             row[headerMap['更新日時'] - 1] = now;
             notifyBatchSheet.getRange(1, 1, batchData.length, batchData[0].length).setValues(batchData);
             appendNotificationLog('半期初回通知', '', hqTo, resolvedBatchId, '成功');
-            uiAlertSafe(`初回通知を送信しました。\nbatchId: ${resolvedBatchId}`);
+            if (!(options === null || options === void 0 ? void 0 : options.suppressUi)) {
+                uiAlertSafe(`初回通知を送信しました。\nbatchId: ${resolvedBatchId}`);
+            }
         }
         catch (err) {
             appendNotificationLog('半期初回通知', '', hqTo, resolvedBatchId, `失敗: ${err}`);
@@ -1424,29 +1431,19 @@ function applyMasterUpdates(batchId, options) {
                 const newEnd = parseDateValue(getCellRaw(cRow, ch['新契約満了日']));
                 setVehicle('契約開始日', toDateOnly(newStart, tz));
                 setVehicle('契約満了日', toDateOnly(newEnd, tz));
-                setVehicle('更新方針', policy);
-                setVehicle('一次回答', policy);
                 setVehicle('最終決定', policy);
-                setVehicle('完了フラグ', true);
                 setVehicle('完了日', now);
-                setVehicle('完了メモ', '半期バッチで更新反映');
                 appliedDetails.push(`契約開始日=${formatDateLabel(newStart, tz)}`);
                 appliedDetails.push(`契約満了日=${formatDateLabel(newEnd, tz)}`);
-                appliedDetails.push('更新方針/一次回答/最終決定=更新');
-                appliedDetails.push('完了フラグ=TRUE');
-                appliedDetails.push('完了メモ=半期バッチで更新反映');
+                appliedDetails.push('最終決定=更新');
+                appliedDetails.push(`完了日=${formatDateLabel(now, tz)}`);
             }
             else {
-                setVehicle('更新方針', policy);
-                setVehicle('一次回答', policy);
                 setVehicle('最終決定', policy);
-                setVehicle('完了フラグ', true);
                 setVehicle('完了日', now);
-                setVehicle('完了メモ', '半期バッチで解約反映');
                 rowIndexesToGray.push(vehicleRowIndex + 1);
-                appliedDetails.push(`更新方針/一次回答/最終決定=${policy}`);
-                appliedDetails.push('完了フラグ=TRUE');
-                appliedDetails.push('完了メモ=半期バッチで解約反映');
+                appliedDetails.push(`最終決定=${policy}`);
+                appliedDetails.push(`完了日=${formatDateLabel(now, tz)}`);
                 appliedDetails.push('車両一覧の対象行をグレーアウト');
             }
             setInvalidReason('');
@@ -1530,16 +1527,49 @@ function buildSheetUrlWithGid(ss, sheet) {
     }
 }
 function runDaily() {
-    // 旧関数名を残しつつ、実行内容は半期バッチ導線へ切り替える。
-    runBiannualSchedule();
+    const diagnosis = prepareManualStartLaunchDiagnosis();
+    if (diagnosis.status === START_LAUNCH_STATUS.BLOCKED) {
+        uiShowModalSafe(buildStartLaunchTitle(diagnosis), buildStartLaunchBody(diagnosis));
+        return;
+    }
+    if (diagnosis.status === START_LAUNCH_STATUS.CONFIRM_REQUIRED) {
+        showStartLaunchConfirmDialog(diagnosis);
+        return;
+    }
+    const result = runBiannualScheduleWithSummary(diagnosis);
+    uiShowModalSafe(result.title, result.body);
 }
 function runBiannualSchedule() {
     syncSchema();
     syncVehicles();
-    createBiannualBatch();
-    sendHqInitialEmail();
-    sendHqReminderIfNeeded();
-    sendSenmuApprovalRequestIfReady();
+    const diagnosis = diagnoseStartLaunch(START_LAUNCH_DIAG_MODE.SCHEDULED);
+    if (diagnosis.status === START_LAUNCH_STATUS.BLOCKED) {
+        notifyScheduledStartBlocked(diagnosis);
+        return '';
+    }
+    clearScheduledStartBlockedNotice(diagnosis.batchId);
+    const result = runBiannualScheduleCore(diagnosis);
+    if (diagnosis.warningMessages.length > 0) {
+        appendNotificationLog('半期自動開始', '', '', result.batchId, `警告付きで開始: ${diagnosis.warningMessages.join(' / ')}`);
+    }
+    else {
+        appendNotificationLog('半期自動開始', '', '', result.batchId, '成功');
+    }
+    return result.batchId;
+}
+function continueRunDailyAfterConfirmation() {
+    const diagnosis = prepareManualStartLaunchDiagnosis();
+    if (diagnosis.status === START_LAUNCH_STATUS.BLOCKED) {
+        return {
+            title: buildStartLaunchTitle(diagnosis),
+            body: buildStartLaunchBody(diagnosis),
+        };
+    }
+    const result = runBiannualScheduleWithSummary(diagnosis);
+    return {
+        title: result.title,
+        body: result.body,
+    };
 }
 function runAutoAdvance() {
     const settings = loadSettings();
@@ -1711,6 +1741,304 @@ function seedSettings() {
     if (rows.length > 0) {
         sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, descIndex ? 3 : 2).setValues(rows);
     }
+}
+function prepareManualStartLaunchDiagnosis() {
+    syncSchema();
+    syncVehicles();
+    installDailyTriggers();
+    return diagnoseStartLaunch(START_LAUNCH_DIAG_MODE.MANUAL);
+}
+function diagnoseStartLaunch(mode) {
+    const ss = getSpreadsheet();
+    const tz = ss.getSpreadsheetTimeZone();
+    const settings = loadSettings();
+    const batchDef = resolveBiannualBatchDefinition(new Date(), tz, settings);
+    const schemaDriftMessages = checkSchemaDrift();
+    const missingSettingLabels = START_REQUIRED_SETTING_LABELS.filter(({ key }) => !String(settings[key] || '').trim()).map(({ label }) => label);
+    const needsInputSummary = summarizeNeedsInput();
+    const existingBatch = findExistingBatchSummary(batchDef.batchId);
+    const blockingMessages = [];
+    const warningMessages = [];
+    if (missingSettingLabels.length > 0) {
+        blockingMessages.push(`設定シートの必須通知先が未入力です: ${missingSettingLabels.join(' / ')}`);
+    }
+    if (schemaDriftMessages.length > 0) {
+        warningMessages.push(`シート構造の不足を検知しました。syncSchema() で補完済みですが、念のため内容を確認してください。`);
+    }
+    if (needsInputSummary.count > 0) {
+        const reasonText = needsInputSummary.reasonCounts.length > 0
+            ? `主な内容: ${needsInputSummary.reasonCounts.map((entry) => `${entry.reason} ${entry.count}件`).join(' / ')}`
+            : '要入力シートに未整備の行があります。';
+        if (mode === START_LAUNCH_DIAG_MODE.SCHEDULED) {
+            blockingMessages.push(`要入力が ${needsInputSummary.count} 件あるため、自動開始を停止しました。${reasonText}`);
+        }
+        else {
+            warningMessages.push(`要入力は、台帳の未整備を知らせる一覧です。今回の開始は可能ですが、後続の確認や反映で詰まる原因になるため、早めの修正を推奨します。自動実行では停止対象です。${reasonText}`);
+        }
+    }
+    if (!settings.mailSendEnabled) {
+        warningMessages.push('通知_メール送信=FALSE です。メール送信を実施せず画面上の処理確認だけを行う設定なので、本番運用開始なら TRUE への切替が必要です。');
+    }
+    if (existingBatch) {
+        warningMessages.push(`同一便の既存バッチ ${existingBatch.batchId}（ステータス: ${existingBatch.status || '未設定'}）が見つかりました。続行すると新規起票ではなく既存バッチの再利用として動作します。`);
+    }
+    const status = blockingMessages.length > 0
+        ? START_LAUNCH_STATUS.BLOCKED
+        : warningMessages.length > 0
+            ? START_LAUNCH_STATUS.CONFIRM_REQUIRED
+            : START_LAUNCH_STATUS.READY;
+    return {
+        status,
+        mode,
+        batchId: batchDef.batchId,
+        batchLabel: batchDef.label,
+        blockingMessages,
+        warningMessages,
+        missingSettingLabels,
+        needsInputSummary,
+        schemaDriftMessages,
+        existingBatch,
+        mailSendEnabled: settings.mailSendEnabled,
+        preparedSteps: ['スキーマ同期済み', '車両同期済み', 'トリガー再設定済み'],
+    };
+}
+function summarizeNeedsInput() {
+    const ss = getSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAMES.NEEDS_INPUT);
+    if (!sheet || sheet.getLastRow() <= 1) {
+        return {
+            count: 0,
+            reasonCounts: [],
+        };
+    }
+    const data = sheet.getDataRange().getValues();
+    const headerMap = data.length > 0 ? getHeaderMap(data[0]) : {};
+    const reasonIndex = headerMap['不備内容'];
+    const counts = {};
+    let total = 0;
+    for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        if (row.every((cell) => cell === '' || cell === null))
+            continue;
+        total += 1;
+        const reason = reasonIndex ? getCellValue(row, reasonIndex) : '';
+        const normalizedReason = reason || '未分類';
+        counts[normalizedReason] = (counts[normalizedReason] || 0) + 1;
+    }
+    const reasonCounts = Object.keys(counts)
+        .map((reason) => ({ reason, count: counts[reason] }))
+        .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason))
+        .slice(0, 5);
+    return {
+        count: total,
+        reasonCounts,
+    };
+}
+function findExistingBatchSummary(batchId) {
+    const ss = getSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAMES.NOTIFY_BATCH);
+    if (!sheet || sheet.getLastRow() <= 1)
+        return null;
+    const data = sheet.getDataRange().getValues();
+    const headerMap = data.length > 0 ? getHeaderMap(data[0]) : {};
+    const rowInfo = findNotifyBatchRow(data, headerMap, batchId);
+    if (!rowInfo)
+        return null;
+    return {
+        batchId,
+        status: getCellValue(rowInfo.row, headerMap['ステータス']),
+        confirmationSheetName: getCellValue(rowInfo.row, headerMap['確認用シート名']),
+        initialSentAt: parseDateValue(getCellRaw(rowInfo.row, headerMap['初回通知送信日時'])),
+    };
+}
+function runBiannualScheduleCore(diagnosis) {
+    const resolvedDiagnosis = diagnosis || diagnoseStartLaunch(START_LAUNCH_DIAG_MODE.MANUAL);
+    const batchId = createBiannualBatch({ suppressUi: true });
+    sendHqInitialEmail(batchId, { suppressUi: true });
+    sendHqReminderIfNeeded(batchId);
+    sendSenmuApprovalRequestIfReady(batchId);
+    const context = getNotifyBatchContext(batchId);
+    return {
+        diagnosis: resolvedDiagnosis,
+        batchId,
+        context,
+    };
+}
+function runBiannualScheduleWithSummary(diagnosis) {
+    const execution = runBiannualScheduleCore(diagnosis);
+    const resolvedDiagnosis = execution.diagnosis;
+    const context = execution.context;
+    const batchId = execution.batchId;
+    const targetCount = context ? Number(getCellValue(context.row, context.headerMap['対象件数']) || 0) : 0;
+    const confirmationSheetName = context ? getCellValue(context.row, context.headerMap['確認用シート名']) : '';
+    const initialSentAt = context ? parseDateValue(getCellRaw(context.row, context.headerMap['初回通知送信日時'])) : null;
+    const status = context ? getCellValue(context.row, context.headerMap['ステータス']) : '';
+    const lines = [];
+    lines.push(`${resolvedDiagnosis.batchLabel} の開始処理を実行しました。`);
+    lines.push('');
+    lines.push('実施した準備:');
+    resolvedDiagnosis.preparedSteps.forEach((step) => lines.push(`- ${step}`));
+    lines.push('');
+    lines.push('開始結果:');
+    lines.push(`- batchId: ${batchId}`);
+    lines.push(`- 通知バッチのステータス: ${status || '未設定'}`);
+    lines.push(`- 対象件数: ${targetCount}`);
+    lines.push(`- 確認用シート: ${confirmationSheetName || '未作成'}`);
+    if (resolvedDiagnosis.existingBatch) {
+        lines.push(`- 同一便の既存バッチを再利用しました`);
+    }
+    if (!resolvedDiagnosis.mailSendEnabled) {
+        lines.push(`- 初回通知メール: 通知_メール送信=FALSE のため送信スキップ`);
+    }
+    else if (initialSentAt) {
+        lines.push(`- 初回通知メール: 送信処理まで実行済み`);
+    }
+    else {
+        lines.push(`- 初回通知メール: 条件未達または未送信`);
+    }
+    if (resolvedDiagnosis.warningMessages.length > 0) {
+        lines.push('');
+        lines.push('引き続き確認してほしい点:');
+        resolvedDiagnosis.warningMessages.forEach((message) => lines.push(`- ${message}`));
+    }
+    return {
+        title: '開始処理の結果',
+        body: lines.join('\n'),
+    };
+}
+function notifyScheduledStartBlocked(diagnosis) {
+    const settings = loadSettings();
+    const adminTo = String(settings.adminTo || '').trim();
+    const ss = getSpreadsheet();
+    const detailLines = [
+        ...diagnosis.blockingMessages.map((message) => `- ${message}`),
+        ...diagnosis.warningMessages.map((message) => `- ${message}`),
+    ];
+    const mailLines = [
+        `${diagnosis.batchLabel} の自動開始を停止しました。`,
+        '',
+        '停止理由:',
+        ...detailLines,
+        '',
+        '自動実行では、設定不足や要入力がある状態で開始すると対象抽出や通知が不完全になるおそれがあるため、管理者確認が終わるまで開始しない運用にしています。',
+        '設定シートや要入力シートを確認し、必要な修正後にメニュー「新しい確認依頼を開始（対象抽出〜初回通知）」から手動で開始してください。',
+        '',
+        '対象スプレッドシート:',
+        ss.getUrl(),
+        '',
+        `便ID: ${diagnosis.batchId}`,
+    ];
+    const hash = createContentHash(mailLines);
+    const propKey = `${PROP_KEYS.AUTO_START_BLOCK_NOTICE_PREFIX}${diagnosis.batchId}`;
+    const props = PropertiesService.getDocumentProperties();
+    const previousHash = String(props.getProperty(propKey) || '');
+    if (hash === previousHash) {
+        appendNotificationLog('半期自動開始停止', '', adminTo, diagnosis.batchId, '同一内容のため再通知なし');
+        return false;
+    }
+    if (!settings.mailSendEnabled) {
+        appendNotificationLog('半期自動開始停止', '', adminTo, diagnosis.batchId, '通知_メール送信=FALSE のため停止通知を送信スキップ');
+        return false;
+    }
+    if (!adminTo) {
+        appendNotificationLog('半期自動開始停止', '', '', diagnosis.batchId, '運用管理者_通知先Toが未設定のため停止通知を送信できません');
+        return false;
+    }
+    const subject = `【要確認】${diagnosis.batchLabel} の自動開始を停止しました`;
+    MailApp.sendEmail({
+        to: adminTo,
+        subject,
+        name: settings.fromName,
+        body: mailLines.join('\n'),
+    });
+    props.setProperty(propKey, hash);
+    appendNotificationLog('半期自動開始停止', '', adminTo, diagnosis.batchId, `成功 ${diagnosis.blockingMessages.join(' / ')}`);
+    return true;
+}
+function clearScheduledStartBlockedNotice(batchId) {
+    const props = PropertiesService.getDocumentProperties();
+    props.deleteProperty(`${PROP_KEYS.AUTO_START_BLOCK_NOTICE_PREFIX}${batchId}`);
+}
+function buildStartLaunchTitle(diagnosis) {
+    return diagnosis.status === START_LAUNCH_STATUS.BLOCKED ? '開始前チェックで停止しました' : '開始前チェック';
+}
+function buildStartLaunchBody(diagnosis) {
+    const lines = [];
+    lines.push(`${diagnosis.batchLabel} の開始前チェックを行いました。`);
+    lines.push('');
+    lines.push('事前に整えた内容:');
+    diagnosis.preparedSteps.forEach((step) => lines.push(`- ${step}`));
+    if (diagnosis.status === START_LAUNCH_STATUS.BLOCKED) {
+        lines.push('');
+        lines.push('このまま開始すると、確認依頼が送れなかったり、対象抽出が不完全なまま進んだりして業務が中途半端に進むため、開始を止めています。');
+        lines.push('修正が必要な項目:');
+        diagnosis.blockingMessages.forEach((message) => lines.push(`- ${message}`));
+        lines.push('');
+        lines.push('設定シートや要入力シートを確認したあと、もう一度「新しい確認依頼を開始」を実行してください。');
+        return lines.join('\n');
+    }
+    if (diagnosis.warningMessages.length > 0) {
+        lines.push('');
+        lines.push('確認してほしい警告:');
+        diagnosis.warningMessages.forEach((message) => lines.push(`- ${message}`));
+    }
+    else {
+        lines.push('');
+        lines.push('開始前チェックで問題は見つかりませんでした。');
+    }
+    return lines.join('\n');
+}
+function showStartLaunchConfirmDialog(diagnosis) {
+    const title = '開始前チェックの確認';
+    const diagnosisJson = toInlineJson({
+        title,
+        body: buildStartLaunchBody(diagnosis),
+        warningMessages: diagnosis.warningMessages,
+    });
+    const html = HtmlService.createHtmlOutput(`
+    <div style="font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 20px; line-height: 1.6; color: #1f2937;">
+      <h2 style="margin: 0 0 12px; font-size: 20px;">開始前チェックの確認</h2>
+      <div id="content" style="white-space: pre-wrap; font-size: 13px; background: #f8fafc; border: 1px solid #dbe3ec; border-radius: 8px; padding: 16px;"></div>
+      <div id="status" style="display:none; margin-top: 12px; color: #475569; font-size: 12px;">開始処理を実行しています...</div>
+      <div style="display: flex; gap: 12px; justify-content: flex-end; margin-top: 18px;">
+        <button id="cancel" style="padding: 10px 14px; border-radius: 8px; border: 1px solid #cbd5e1; background: #fff; cursor: pointer;">キャンセル</button>
+        <button id="proceed" style="padding: 10px 14px; border-radius: 8px; border: 0; background: #1d4ed8; color: #fff; cursor: pointer;">このまま進める</button>
+      </div>
+    </div>
+    <script>
+      const payload = ${diagnosisJson};
+      const content = document.getElementById('content');
+      const status = document.getElementById('status');
+      const proceedButton = document.getElementById('proceed');
+      const cancelButton = document.getElementById('cancel');
+      content.textContent = payload.body;
+
+      cancelButton.addEventListener('click', () => google.script.host.close());
+      proceedButton.addEventListener('click', () => {
+        proceedButton.disabled = true;
+        cancelButton.disabled = true;
+        status.style.display = 'block';
+        google.script.run
+          .withSuccessHandler((result) => {
+            proceedButton.style.display = 'none';
+            cancelButton.textContent = '閉じる';
+            cancelButton.disabled = false;
+            content.textContent = result.body;
+            status.style.display = 'none';
+          })
+          .withFailureHandler((error) => {
+            proceedButton.disabled = false;
+            cancelButton.disabled = false;
+            status.style.display = 'none';
+            content.textContent = '開始処理でエラーが発生しました。\\n' + (error && error.message ? error.message : error);
+          })
+          .continueRunDailyAfterConfirmation();
+      });
+    </script>
+  `)
+        .setWidth(860)
+        .setHeight(640);
+    SpreadsheetApp.getUi().showModalDialog(html, title);
 }
 function valuesFromSettingsSheet(data, headerMap, key) {
     const keyIndex = headerMap['設定項目'];
@@ -2926,6 +3254,7 @@ function loadSettings() {
         autoApplyMasterUpdates: toBoolean(values['自動進行_マスター反映_有効'], Boolean(SETTINGS_DEFAULTS['自動進行_マスター反映_有効'])),
         autoAdvanceMinIntervalSec: toNumber(values['自動進行_最小間隔秒'], Number(SETTINGS_DEFAULTS['自動進行_最小間隔秒'])),
         finalApproverAccount: toStringValue(values['最終承認者アカウント'], String(SETTINGS_DEFAULTS['最終承認者アカウント'])),
+        adminTo: toStringValue(values['運用管理者_通知先To'], String(SETTINGS_DEFAULTS['運用管理者_通知先To'])),
         murataTo: toStringValue(values['村田主任_通知先To'], String(SETTINGS_DEFAULTS['村田主任_通知先To'])),
         murataCc: toStringValue(values['村田主任_通知先Cc'], String(SETTINGS_DEFAULTS['村田主任_通知先Cc'])),
     };
@@ -3066,6 +3395,12 @@ function escapeHtml(text) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
+}
+function toInlineJson(value) {
+    return JSON.stringify(value)
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/&/g, '\\u0026');
 }
 function protectViewSheet(sheetName) {
     const ss = getSpreadsheet();
